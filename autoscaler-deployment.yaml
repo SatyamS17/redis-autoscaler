@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-autoscaler
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-autoscaler
+  template:
+    metadata:
+      labels:
+        app: redis-autoscaler
+    spec:
+      containers:
+      - name: autoscaler
+        image: python:3.11-slim
+        command: ["/bin/bash", "/app/install.sh"]
+        volumeMounts:
+        - name: autoscaler-code
+          mountPath: /app
+      volumes:
+      - name: autoscaler-code
+        configMap:
+          name: simple-redis-autoscaler

@@ -1,0 +1,91 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-autoscaler
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: redis-autoscaler-role
+  namespace: default
+rules:
+  # Permission to list and get pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  
+  # Permission to exec into pods (for redis-cli commands)
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  
+  # Permission to manage StatefulSets
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "patch", "update"]
+  
+  # Permission to read metrics
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: redis-autoscaler-binding
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: redis-autoscaler
+    namespace: default
+roleRef:
+  kind: Role
+  name: redis-autoscaler-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-autoscaler
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-autoscaler
+  template:
+    metadata:
+      labels:
+        app: redis-autoscaler
+    spec:
+      serviceAccountName: redis-autoscaler  # Use the ServiceAccount with permissions
+      containers:
+      - name: autoscaler
+        image: your-autoscaler-image:latest
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret  # Your Redis password secret
+              key: password
+        - name: UPSCALE_CPU_THRESHOLD
+          value: "70.0"
+        - name: DOWNSCALE_CPU_THRESHOLD
+          value: "20.0"
+        - name: COOLDOWN_MINUTES
+          value: "5"
+        - name: CHECK_INTERVAL_SECONDS
+          value: "30"
+        - name: MIN_NODES
+          value: "6"
+        - name: MAX_NODES
+          value: "12"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
