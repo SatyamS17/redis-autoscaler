@@ -1,0 +1,29 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: redis-load-scaler
+  namespace: default  # Change from redis to default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: redis-redis-cluster-leader  # Adjust to actual StatefulSet name
+  minReplicaCount: 3
+  maxReplicaCount: 6
+  pollingInterval: 30
+  cooldownPeriod: 150
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
+        metricName: redis_write_rate
+        query: |
+          sum(rate(redis_commands_total{cmd=~"set|hset|incr|del"}[1m]))
+        threshold: "1000"
+    - type: prometheus
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
+        metricName: redis_cpu_percent
+        query: |
+          avg(rate(container_cpu_usage_seconds_total{container="redis"}[1m])) * 100
+        threshold: "70"

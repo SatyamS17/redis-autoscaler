@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis-exporter
+  namespace: default  # Change from redis to default
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: redis-exporter
+  namespaceSelector:
+    matchNames:
+      - default  # Change from redis to default
+  endpoints:
+    - port: metrics
+      interval: 15s

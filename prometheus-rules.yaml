@@ -1,0 +1,171 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-per-pod-metrics
+  namespace: monitoring
+spec:
+  groups:
+  # Per-pod command rates
+  - name: redis-per-pod-commands
+    interval: 15s
+    rules:
+    - record: redis:commands_per_sec:by_pod
+      expr: sum(rate(redis_commands_total[1m])) by (pod, instance)
+      labels:
+        metric_type: "throughput"
+    
+    - record: redis:read_commands_per_sec:by_pod
+      expr: sum(rate(redis_commands_total{cmd=~"get|mget|hget|hgetall|smembers|lrange|zrange"}[1m])) by (pod, instance)
+      labels:
+        metric_type: "read_throughput"
+    
+    - record: redis:write_commands_per_sec:by_pod
+      expr: sum(rate(redis_commands_total{cmd=~"set|hset|sadd|lpush|zadd|incr|decr|del"}[1m])) by (pod, instance)
+      labels:
+        metric_type: "write_throughput"
+    
+    - record: redis:read_write_ratio:by_pod
+      expr: |
+        sum(rate(redis_commands_total{cmd=~"get|mget|hget|hgetall|smembers|lrange|zrange"}[1m])) by (pod, instance)
+        /
+        (sum(rate(redis_commands_total{cmd=~"set|hset|sadd|lpush|zadd|incr|decr|del"}[1m])) by (pod, instance) + 0.001)
+      labels:
+        metric_type: "ratio"
+  
+  # Per-pod resource usage
+  - name: redis-per-pod-resources
+    interval: 15s
+    rules:
+    - record: redis:cpu_percent:by_pod
+      expr: |
+        sum(rate(container_cpu_usage_seconds_total{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}[1m])) by (pod) * 100
+      labels:
+        metric_type: "cpu"
+    
+    - record: redis:memory_used_mb:by_pod
+      expr: |
+        sum(container_memory_working_set_bytes{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}) by (pod) / 1024 / 1024
+      labels:
+        metric_type: "memory"
+    
+    - record: redis:memory_percent:by_pod
+      expr: |
+        sum(redis_memory_used_bytes) by (pod, instance) 
+        / 
+        sum(redis_memory_max_bytes) by (pod, instance) * 100
+      labels:
+        metric_type: "memory_utilization"
+  
+  # Per-pod connection and client metrics
+  - name: redis-per-pod-connections
+    interval: 15s
+    rules:
+    - record: redis:connected_clients:by_pod
+      expr: redis_connected_clients
+      labels:
+        metric_type: "connections"
+    
+    - record: redis:blocked_clients:by_pod
+      expr: redis_blocked_clients
+      labels:
+        metric_type: "connections"
+    
+    - record: redis:client_input_bytes_per_sec:by_pod
+      expr: rate(redis_net_input_bytes_total[1m])
+      labels:
+        metric_type: "network"
+    
+    - record: redis:client_output_bytes_per_sec:by_pod
+      expr: rate(redis_net_output_bytes_total[1m])
+      labels:
+        metric_type: "network"
+  
+  # Per-pod latency and performance
+  - name: redis-per-pod-latency
+    interval: 15s
+    rules:
+    - record: redis:instantaneous_ops_per_sec:by_pod
+      expr: redis_instantaneous_ops_per_sec
+      labels:
+        metric_type: "performance"
+    
+    - record: redis:keyspace_hits_per_sec:by_pod
+      expr: rate(redis_keyspace_hits_total[1m])
+      labels:
+        metric_type: "performance"
+    
+    - record: redis:keyspace_misses_per_sec:by_pod
+      expr: rate(redis_keyspace_misses_total[1m])
+      labels:
+        metric_type: "performance"
+    
+    - record: redis:hit_rate_percent:by_pod
+      expr: |
+        rate(redis_keyspace_hits_total[1m])
+        /
+        (rate(redis_keyspace_hits_total[1m]) + rate(redis_keyspace_misses_total[1m]) + 0.001) * 100
+      labels:
+        metric_type: "performance"
+  
+  # Cluster-wide aggregates (for comparison)
+  - name: redis-cluster-aggregates
+    interval: 15s
+    rules:
+    - record: redis:total_commands_per_sec:cluster
+      expr: sum(redis:commands_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+    
+    - record: redis:avg_cpu_percent:cluster
+      expr: avg(redis:cpu_percent:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+    
+    - record: redis:max_cpu_percent:cluster
+      expr: max(redis:cpu_percent:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+    
+    - record: redis:total_memory_mb:cluster
+      expr: sum(redis:memory_used_mb:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+  
+  # Load classification per pod
+  - name: redis-load-classification
+    interval: 15s
+    rules:
+    # Classify pod as read-heavy (ratio > 3)
+    - record: redis:is_read_heavy:by_pod
+      expr: redis:read_write_ratio:by_pod > 3
+      labels:
+        metric_type: "classification"
+    
+    # Classify pod as write-heavy (ratio < 0.33)
+    - record: redis:is_write_heavy:by_pod
+      expr: redis:read_write_ratio:by_pod < 0.33
+      labels:
+        metric_type: "classification"
+    
+    # Classify pod as CPU constrained (> 12%)
+    - record: redis:is_cpu_constrained:by_pod
+      expr: redis:cpu_percent:by_pod > 12
+      labels:
+        metric_type: "classification"
+    
+    # Classify pod as memory constrained (> 80%)
+    - record: redis:is_memory_constrained:by_pod
+      expr: redis:memory_percent:by_pod > 80
+      labels:
+        metric_type: "classification"
+    
+    # High load indicator (multiple conditions)
+    - record: redis:is_high_load:by_pod
+      expr: |
+        (redis:cpu_percent:by_pod > 12) 
+        or 
+        (redis:memory_percent:by_pod > 80) 
+        or 
+        (redis:commands_per_sec:by_pod > 10000)
+      labels:
+        metric_type: "classification"

@@ -1,0 +1,9 @@
+replicaCount: 1
+rbac:
+  create: true
+serviceAccount:
+  create: true
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true

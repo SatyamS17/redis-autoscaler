@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: default
+  labels:
+    app: redis-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-exporter
+  template:
+    metadata:
+      labels:
+        app: redis-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      containers:
+      - name: redis-exporter
+        image: oliver006/redis_exporter:latest
+        ports:
+        - containerPort: 9121
+          name: metrics
+        env:
+        # Connect to all pods via the headless service
+        - name: REDIS_ADDR
+          value: "redis://redis-redis-cluster-0.redis-redis-cluster-headless:6379,redis://redis-redis-cluster-1.redis-redis-cluster-headless:6379,redis://redis-redis-cluster-2.redis-redis-cluster-headless:6379,redis://redis-redis-cluster-3.redis-redis-cluster-headless:6379,redis://redis-redis-cluster-4.redis-redis-cluster-headless:6379,redis://redis-redis-cluster-5.redis-redis-cluster-headless:6379"
+        - name: REDIS_EXPORTER_CHECK_SINGLE_KEYS
+          value: ""
+        - name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+          value: "true"
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: default
+  labels:
+    app: redis-exporter
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9121
+    targetPort: 9121
+    protocol: TCP
+    name: metrics
+  selector:
+    app: redis-exporter

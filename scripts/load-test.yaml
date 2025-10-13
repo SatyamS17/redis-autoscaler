@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-continuous-load
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-load
+  template:
+    metadata:
+      labels:
+        app: redis-load
+    spec:
+      containers:
+      - name: load
+        image: redis:7
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-redis-cluster
+              key: redis-password
+        command:
+          - sh
+          - -c
+          - |
+            while true; do
+              redis-benchmark -h redis-redis-cluster -a $REDIS_PASSWORD -p 6379 --cluster -c 50 -n 100000 -t set,get
+              sleep 5
+            done

@@ -14,8 +14,8 @@ class RedisAutoscaler:
     def __init__(self):
         self.namespace = "default"
         self.redis_cluster_name = "redis-redis-cluster"
-        self.redis_password = os.getenv('REDIS_PASSWORD', 'xep0UULRo5')
-        self.upscale_threshold = float(os.getenv('UPSCALE_CPU_THRESHOLD', '14.0'))
+        self.redis_password = os.getenv('REDIS_PASSWORD', 'PK1QCCFHGp')
+        self.upscale_threshold = float(os.getenv('UPSCALE_CPU_THRESHOLD', '10.0'))
         self.downscale_threshold = float(os.getenv('DOWNSCALE_CPU_THRESHOLD', '5.0'))
         self.cooldown_minutes = int(os.getenv('COOLDOWN_MINUTES', '1'))
         self.check_interval = int(os.getenv('CHECK_INTERVAL_SECONDS', '30'))
@@ -574,6 +574,30 @@ class RedisAutoscaler:
         logger.error(f"❌ Timeout waiting for pods to be ready")
         return False
 
+    def reshard_slots(self, pod_name: str, source_id: str, target_id: str, 
+                    total_slots: int) -> bool:
+        """Reshard slots in a single request with large pipeline"""
+        cluster_endpoint = f"{self.get_redis_pods()[0]['ip']}:6379"
+        
+        logger.info(f"📦 Resharding {total_slots} slots in single request with large pipeline")
+        
+        reshard_cmd = (f"--cluster reshard {cluster_endpoint} "
+                    f"--cluster-from {source_id} "
+                    f"--cluster-to {target_id} "
+                    f"--cluster-slots {total_slots} "
+                    f"--cluster-yes "
+                    f"--cluster-timeout 60000 "
+                    f"--cluster-pipeline 10000")
+        
+        success, output = self.execute_redis_command(pod_name, reshard_cmd)
+        
+        if not success:
+            logger.error(f"❌ Reshard failed: {output}")
+            return False
+        
+        logger.info(f"✅ Resharding completed: {total_slots} slots moved")
+        return True
+
     def scale_up(self, current_count: int) -> bool:
         """Scale up the cluster by adding master-replica pairs"""
         logger.info("🚀 Starting scale-up operation...")
@@ -631,10 +655,8 @@ class RedisAutoscaler:
                 elif len(info['slots']) > 0:
                     source_masters.append(info)
         
-        # Reshard slots to empty masters
+        # Reshard slots to empty masters INCREMENTALLY
         if empty_masters and source_masters:
-            cluster_endpoint = f"{pods[0]['ip']}:6379"
-            
             # Calculate how many slots to move to each new master
             total_slots = sum(len(m['slots']) for m in source_masters)
             total_masters = len(source_masters) + len(empty_masters)
@@ -643,41 +665,28 @@ class RedisAutoscaler:
             logger.info(f"📊 Total slots: {total_slots}, Target per master: {target_slots_per_master}")
             
             for empty_master in empty_masters:
-                # Distribute slots evenly from source masters
                 slots_to_move = target_slots_per_master
                 target_id = empty_master['node_id']
                 
-                logger.info(f"📤 Moving {slots_to_move} slots to new master {target_id[:8]}...")
+                logger.info(f"📤 Moving {slots_to_move} slots to new master {target_id[:8]}... (incremental)")
                 
                 # Collect all source master IDs
                 source_ids = ','.join([m['node_id'] for m in source_masters if len(m['slots']) > 0])
                 
-                reshard_cmd = (f"--cluster reshard {cluster_endpoint} "
-                            f"--cluster-from {source_ids} "
-                            f"--cluster-to {target_id} "
-                            f"--cluster-slots {slots_to_move} "
-                            f"--cluster-yes "
-                            f"--cluster-timeout 30000 "
-                            f"--cluster-pipeline 10")
-                
-                success, output = self.execute_redis_command(pods[0]['name'], reshard_cmd)
+                # Use incremental resharding with 100-slot batches
+                success = self.reshard_slots(
+                    pods[0]['name'], 
+                    source_ids,
+                    target_id,
+                    slots_to_move
+                )
                 
                 if success:
                     logger.info(f"✅ Successfully moved {slots_to_move} slots to {target_id[:8]}")
                 else:
-                    logger.error(f"❌ Failed to reshard slots: {output}")
+                    logger.error(f"❌ Failed to reshard slots incrementally")
                 
-                time.sleep(15)
-            
-            # Final rebalance to even things out
-            logger.info("⚖️ Final rebalance to optimize distribution...")
-            rebalance_cmd = f"--cluster rebalance {cluster_endpoint}"
-            success, output = self.execute_redis_command(pods[0]['name'], rebalance_cmd)
-            
-            if success:
-                logger.info("✅ Final rebalance completed")
-            else:
-                logger.warning(f"⚠️ Final rebalance had issues: {output}")
+                time.sleep(5)
         else:
             logger.info("✅ No empty masters found or no source masters available")
         
@@ -695,6 +704,7 @@ class RedisAutoscaler:
         
         self.last_scale_time = datetime.now()
         return True
+
 
     def scale_down(self, nodes_to_remove: List[str], current_count: int) -> bool:
         """Scale down the cluster by removing master-replica pairs"""
@@ -774,13 +784,13 @@ class RedisAutoscaler:
         
         removed_count = 0
         
-        # CHANGED: Process masters FIRST (redistribute slots and remove)
+        # Process masters FIRST (redistribute slots and remove)
         for pod_name, pod_ip, node_info in masters_to_remove:
             node_id = node_info['node_id']
             
             logger.info(f"🎯 Processing master: {pod_name} ({pod_ip})")
             
-            # If this master has slots, redistribute them
+            # If this master has slots, redistribute them INCREMENTALLY
             if node_info['slots']:
                 slot_count = len(node_info['slots'])
                 logger.info(f"📦 Master {pod_name} has {slot_count} slots to redistribute")
@@ -803,7 +813,7 @@ class RedisAutoscaler:
                     logger.error(f"❌ No target masters available for slot redistribution")
                     continue
                 
-                logger.info(f"🔄 Redistributing {slot_count} slots from {pod_name}")
+                logger.info(f"🔄 Redistributing {slot_count} slots from {pod_name} (incremental)")
                 
                 slots_per_master = slot_count // len(target_masters)
                 remaining_slots = slot_count % len(target_masters)
@@ -817,20 +827,18 @@ class RedisAutoscaler:
                     target_id = target_master['node_id']
                     target_ip_port = target_master['ip_port']
                     
-                    logger.info(f"  📤 Moving {slots_to_move} slots to {target_id[:8]}... ({target_ip_port})")
+                    logger.info(f"  📤 Moving {slots_to_move} slots to {target_id[:8]}... ({target_ip_port}) incrementally")
                     
-                    reshard_cmd = (f"--cluster reshard {cluster_endpoint} "
-                                f"--cluster-from {node_id} "
-                                f"--cluster-to {target_id} "
-                                f"--cluster-slots {slots_to_move} "
-                                f"--cluster-yes "
-                                f"--cluster-timeout 10000 "
-                                f"--cluster-pipeline 200")
-                    
-                    success, output = self.execute_redis_command(primary_pod_name, reshard_cmd)
+                    # Use incremental resharding
+                    success = self.reshard_slots(
+                        primary_pod_name,
+                        node_id,
+                        target_id,
+                        slots_to_move
+                    )
                     
                     if not success:
-                        logger.error(f"❌ Failed to reshard slots to {target_id[:8]}: {output}")
+                        logger.error(f"❌ Failed to reshard slots to {target_id[:8]}")
                         
                         # Retry with fix
                         logger.info("🔧 Fixing cluster and retrying...")
@@ -838,13 +846,19 @@ class RedisAutoscaler:
                         self.execute_redis_command(primary_pod_name, fix_cmd)
                         time.sleep(15)
                         
-                        success, output = self.execute_redis_command(primary_pod_name, reshard_cmd)
+                        success = self.reshard_slots(
+                            primary_pod_name,
+                            node_id,
+                            target_id,
+                            slots_to_move
+                        )
+                        
                         if not success:
                             logger.error(f"❌ Failed to reshard slots to {target_id[:8]} on retry")
                             return False
                     
                     logger.info(f"  ✅ Successfully moved {slots_to_move} slots")
-                    time.sleep(10)
+                    time.sleep(5)
                 
                 logger.info(f"✅ Completed slot redistribution for {pod_name}")
                 
@@ -869,7 +883,7 @@ class RedisAutoscaler:
             else:
                 logger.error(f"❌ Failed to remove master {pod_name} from cluster: {output}")
         
-        # CHANGED: Now remove replicas AFTER masters are cleaned up
+        # Now remove replicas AFTER masters are cleaned up
         logger.info("🔄 Now removing replicas after masters are cleaned up...")
         time.sleep(5)
         
@@ -906,17 +920,6 @@ class RedisAutoscaler:
                 
                 self.last_scale_time = datetime.now()
                 logger.info(f"✅ Scale-down completed: removed {removed_count} nodes")
-                
-                # Final rebalance
-                time.sleep(10)
-                logger.info("⚖️ Final cluster rebalance...")
-                rebalance_cmd = f"--cluster rebalance {cluster_endpoint}"
-                success, output = self.execute_redis_command(primary_pod_name, rebalance_cmd)
-                
-                if success:
-                    logger.info("✅ Final rebalance completed")
-                else:
-                    logger.warning(f"⚠️ Final rebalance had issues: {output}")
                 
                 return True
             else:
@@ -1307,3 +1310,32 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# SAVE THIS
+
+    # scale read 
+    # write latecny gets bad why? how can we go around it
+    # resharding is a very heavy operation (last resort operation)
+    # explore everyhting before resharding
+        # add repliacas
+        # scaling up container 
+    # tie into the decision tree
+        # track read and write requests (ratio)
+        # figure out the distribution of the load (for both read and write)
+
+        # what is the bottleneck (CPU, disk, etc) *dont make
+        # what should be the decision that we should be resharding
+
+        # if read heavy + high CPU 
+            # add replica
+        
+        # figure out how the breakdown of the variables determine which one you should do
+    
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# make it deliverable by researching what issues peoiple are looking for in redis that you can adress and focus on the issues taht you can tackle
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# keep posting on slack
+
+# clickhouse and elasticsearch
