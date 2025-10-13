@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
 """
-Redis Cluster Scaling Decision Engine
+Redis Cluster Scaling Decision Engine - Continuous Monitoring Mode
 
-Queries Prometheus for per-pod metrics and makes scaling recommendations
-based on a decision tree approach.
+Queries Prometheus for per-pod CPU and memory metrics only.
+Works without redis-exporter, using only container metrics.
+Runs continuously and makes periodic scaling decisions.
 """
 
 import requests
 import json
+import time
+import sys
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # Configuration
 PROMETHEUS_URL = "http://localhost:9090"
-# Then use: PROMETHEUS_URL = "http://localhost:9090"
+CHECK_INTERVAL_SECONDS = 10
+DECISION_HISTORY_FILE = "scaling_decisions_history.json"
 
 class PodMetrics:
     def __init__(self, pod_name: str):
         self.pod_name = pod_name
         self.cpu_percent = 0.0
-        self.memory_percent = 0.0
-        self.commands_per_sec = 0.0
-        self.read_commands_per_sec = 0.0
-        self.write_commands_per_sec = 0.0
-        self.read_write_ratio = 0.0
-        self.connected_clients = 0
+        self.memory_used_mb = 0.0
         self.is_high_load = False
         self.is_cpu_constrained = False
         self.is_memory_constrained = False
-        self.is_read_heavy = False
-        self.is_write_heavy = False
 
     def __repr__(self):
         return f"PodMetrics({self.pod_name})"
 
 class ScalingDecision:
     def __init__(self, action: str, reason: str, target_pods: List[str], priority: int):
-        self.action = action  # "scale_horizontal", "scale_vertical", "add_replica", "no_action"
+        self.action = action  # "scale_horizontal", "scale_vertical", "no_action"
         self.reason = reason
         self.target_pods = target_pods
         self.priority = priority  # 1=critical, 2=important, 3=nice-to-have
@@ -44,6 +41,15 @@ class ScalingDecision:
 
     def __repr__(self):
         return f"ScalingDecision(action={self.action}, priority={self.priority}, targets={self.target_pods})"
+    
+    def to_dict(self):
+        return {
+            "action": self.action,
+            "reason": self.reason,
+            "target_pods": self.target_pods,
+            "priority": self.priority,
+            "timestamp": self.timestamp.isoformat()
+        }
 
 def query_prometheus(query: str) -> List[Dict]:
     """Query Prometheus and return results"""
@@ -69,21 +75,23 @@ def get_pod_metrics() -> Dict[str, PodMetrics]:
     """Fetch all relevant metrics for each Redis pod"""
     pods = {}
     
-    # Define queries
-    queries = {
-        "cpu": "redis:cpu_percent:by_pod",
-        "memory": "redis:memory_percent:by_pod",
-        "commands": "redis:commands_per_sec:by_pod",
-        "read_commands": "redis:read_commands_per_sec:by_pod",
-        "write_commands": "redis:write_commands_per_sec:by_pod",
-        "read_write_ratio": "redis:read_write_ratio:by_pod",
-        "connected_clients": "redis:connected_clients:by_pod",
-        "is_high_load": "redis:is_high_load:by_pod",
-        "is_cpu_constrained": "redis:is_cpu_constrained:by_pod",
-        "is_memory_constrained": "redis:is_memory_constrained:by_pod",
-        "is_read_heavy": "redis:is_read_heavy:by_pod",
-        "is_write_heavy": "redis:is_write_heavy:by_pod",
-    }
+    # Try recording rules first, fall back to raw queries
+    test_query = query_prometheus("redis:cpu_percent:by_pod")
+    use_recording_rules = len(test_query) > 0
+    
+    if use_recording_rules:
+        queries = {
+            "cpu_percent": "redis:cpu_percent:by_pod",
+            "memory_used_mb": "redis:memory_used_mb:by_pod",
+            "is_high_load": "redis:is_high_load:by_pod",
+            "is_cpu_constrained": "redis:is_cpu_constrained:by_pod",
+            "is_memory_constrained": "redis:is_memory_constrained:by_pod",
+        }
+    else:
+        queries = {
+            "cpu_percent": 'sum(rate(container_cpu_usage_seconds_total{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}[1m])) by (pod) * 100',
+            "memory_used_mb": 'sum(container_memory_working_set_bytes{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}) by (pod) / 1024 / 1024',
+        }
     
     # Fetch metrics
     for metric_name, query in queries.items():
@@ -98,19 +106,29 @@ def get_pod_metrics() -> Dict[str, PodMetrics]:
                 pods[pod_name] = PodMetrics(pod_name)
             
             # Set metric value
-            setattr(pods[pod_name], metric_name, value)
+            if metric_name.startswith("is_"):
+                setattr(pods[pod_name], metric_name, bool(value))
+            else:
+                setattr(pods[pod_name], metric_name, value)
+    
+    # Calculate derived metrics if using raw queries
+    if not use_recording_rules:
+        for pod_name, metrics in pods.items():
+            metrics.is_cpu_constrained = metrics.cpu_percent > 12
+            metrics.is_memory_constrained = metrics.memory_used_mb > 800
+            metrics.is_high_load = metrics.is_cpu_constrained or metrics.is_memory_constrained
     
     return pods
 
 def decision_tree(pod_metrics: Dict[str, PodMetrics]) -> List[ScalingDecision]:
     """
-    Decision tree for scaling recommendations
+    Simplified decision tree based only on CPU and memory
     
     Decision Flow:
-    1. Check for critical issues (CPU/Memory > 80%)
-    2. Check for high load indicators
-    3. Analyze read/write patterns
-    4. Make recommendation
+    1. Check for critical CPU constraint (> 12%)
+    2. Check for critical memory constraint (> 80%)
+    3. Check for sustained high load
+    4. Cluster-wide analysis
     """
     decisions = []
     
@@ -118,209 +136,223 @@ def decision_tree(pod_metrics: Dict[str, PodMetrics]) -> List[ScalingDecision]:
     for pod_name, metrics in pod_metrics.items():
         
         # CRITICAL: CPU Constraint
-        if metrics.cpu_percent > 12:
-            if metrics.is_write_heavy:
-                decisions.append(ScalingDecision(
-                    action="scale_horizontal",
-                    reason=f"{pod_name}: CPU {metrics.cpu_percent:.1f}% (write-heavy workload)",
-                    target_pods=[pod_name],
-                    priority=1
-                ))
-            else:
-                decisions.append(ScalingDecision(
-                    action="scale_vertical",
-                    reason=f"{pod_name}: CPU {metrics.cpu_percent:.1f}% (increase CPU limit)",
-                    target_pods=[pod_name],
-                    priority=1
-                ))
-        
-        # CRITICAL: Memory Constraint
-        elif metrics.memory_percent > 80:
+        if metrics.is_cpu_constrained:
             decisions.append(ScalingDecision(
-                action="scale_vertical",
-                reason=f"{pod_name}: Memory {metrics.memory_percent:.1f}% (increase memory limit)",
+                action="scale_horizontal",
+                reason=f"{pod_name}: CPU {metrics.cpu_percent:.1f}% exceeds threshold (12%)",
                 target_pods=[pod_name],
                 priority=1
             ))
         
-        # HIGH LOAD: Read-Heavy
-        elif metrics.is_read_heavy and metrics.cpu_percent > 12:
+        # CRITICAL: Memory Constraint
+        elif metrics.is_memory_constrained:
             decisions.append(ScalingDecision(
-                action="add_replica",
-                reason=f"{pod_name}: Read-heavy (R/W ratio {metrics.read_write_ratio:.2f}) + CPU {metrics.cpu_percent:.1f}%",
+                action="scale_vertical",
+                reason=f"{pod_name}: Memory {metrics.memory_used_mb:.0f} MB near limit",
                 target_pods=[pod_name],
-                priority=2
+                priority=1
             ))
         
-        # HIGH LOAD: Write-Heavy
-        elif metrics.is_write_heavy and metrics.cpu_percent > 12:
-            decisions.append(ScalingDecision(
-                action="scale_horizontal",
-                reason=f"{pod_name}: Write-heavy (R/W ratio {metrics.read_write_ratio:.2f}) + CPU {metrics.cpu_percent:.1f}%",
-                target_pods=[pod_name],
-                priority=2
-            ))
-        
-        # MODERATE LOAD: High Commands
-        elif metrics.commands_per_sec > 5000 and metrics.cpu_percent > 10:
-            decisions.append(ScalingDecision(
-                action="scale_horizontal",
-                reason=f"{pod_name}: High throughput ({metrics.commands_per_sec:.0f} cmd/s) + CPU {metrics.cpu_percent:.1f}%",
-                target_pods=[pod_name],
-                priority=2
-            ))
+        # HIGH LOAD: Both CPU and memory elevated (but not critical)
+        elif metrics.is_high_load:
+            if metrics.cpu_percent > 8:  # Approaching CPU threshold
+                decisions.append(ScalingDecision(
+                    action="scale_horizontal",
+                    reason=f"{pod_name}: High load - CPU {metrics.cpu_percent:.1f}%",
+                    target_pods=[pod_name],
+                    priority=2
+                ))
     
     # Cluster-wide analysis
     total_pods = len(pod_metrics)
-    high_load_pods = sum(1 for m in pod_metrics.values() if m.is_high_load)
-    avg_cpu = sum(m.cpu_percent for m in pod_metrics.values()) / total_pods if total_pods > 0 else 0
+    if total_pods > 0:
+        high_load_pods = sum(1 for m in pod_metrics.values() if m.is_high_load)
+        cpu_constrained_pods = sum(1 for m in pod_metrics.values() if m.is_cpu_constrained)
+        avg_cpu = sum(m.cpu_percent for m in pod_metrics.values()) / total_pods
+        
+        # If majority of pods are CPU constrained
+        if cpu_constrained_pods >= total_pods * 0.5:
+            decisions.append(ScalingDecision(
+                action="scale_horizontal",
+                reason=f"Cluster-wide: {cpu_constrained_pods}/{total_pods} pods CPU constrained, avg CPU {avg_cpu:.1f}%",
+                target_pods=list(pod_metrics.keys()),
+                priority=1
+            ))
+        
+        # If majority of pods under high load
+        elif high_load_pods >= total_pods * 0.6:
+            decisions.append(ScalingDecision(
+                action="scale_horizontal",
+                reason=f"Cluster-wide: {high_load_pods}/{total_pods} pods under high load, avg CPU {avg_cpu:.1f}%",
+                target_pods=list(pod_metrics.keys()),
+                priority=2
+            ))
     
-    # If majority of pods are under load
-    if high_load_pods >= total_pods * 0.6:
-        decisions.append(ScalingDecision(
-            action="scale_horizontal",
-            reason=f"Cluster-wide: {high_load_pods}/{total_pods} pods under high load, avg CPU {avg_cpu:.1f}%",
-            target_pods=list(pod_metrics.keys()),
-            priority=1
-        ))
-    
-    # Sort by priority
+    # Sort by priority (critical first)
     decisions.sort(key=lambda d: d.priority)
     
     return decisions
 
-def print_pod_summary(pod_metrics: Dict[str, PodMetrics]):
+def print_pod_summary(pod_metrics: Dict[str, PodMetrics], compact: bool = False):
     """Print a summary table of pod metrics"""
-    print("\n" + "="*120)
-    print("REDIS POD METRICS SUMMARY")
-    print("="*120)
-    print(f"{'Pod Name':<25} {'CPU%':<8} {'Mem%':<8} {'Cmd/s':<10} {'R/W Ratio':<12} {'Clients':<10} {'Status':<20}")
-    print("-"*120)
-    
-    for pod_name, metrics in sorted(pod_metrics.items()):
-        status = []
-        if metrics.is_high_load:
-            status.append("HIGH_LOAD")
-        if metrics.is_cpu_constrained:
-            status.append("CPU_LIMIT")
-        if metrics.is_memory_constrained:
-            status.append("MEM_LIMIT")
-        if metrics.is_read_heavy:
-            status.append("READ_HEAVY")
-        if metrics.is_write_heavy:
-            status.append("WRITE_HEAVY")
+    if compact:
+        # Compact one-line summary
+        total = len(pod_metrics)
+        avg_cpu = sum(m.cpu_percent for m in pod_metrics.values()) / total if total > 0 else 0
+        max_cpu = max((m.cpu_percent for m in pod_metrics.values()), default=0)
+        high_load = sum(1 for m in pod_metrics.values() if m.is_high_load)
+        print(f"Pods: {total} | Avg CPU: {avg_cpu:.1f}% | Max CPU: {max_cpu:.1f}% | High Load: {high_load}/{total}")
+    else:
+        print("\n" + "="*100)
+        print("REDIS POD METRICS SUMMARY")
+        print("="*100)
+        print(f"{'Pod Name':<30} {'CPU%':<10} {'Memory (MB)':<15} {'Status':<30}")
+        print("-"*100)
         
-        status_str = ",".join(status) if status else "OK"
+        for pod_name, metrics in sorted(pod_metrics.items()):
+            status = []
+            if metrics.is_high_load:
+                status.append("HIGH_LOAD")
+            if metrics.is_cpu_constrained:
+                status.append("CPU_CONSTRAINED")
+            if metrics.is_memory_constrained:
+                status.append("MEMORY_CONSTRAINED")
+            
+            status_str = ", ".join(status) if status else "OK"
+            
+            print(f"{pod_name:<30} {metrics.cpu_percent:<10.2f} {metrics.memory_used_mb:<15.0f} {status_str:<30}")
         
-        print(f"{pod_name:<25} {metrics.cpu_percent:<8.1f} {metrics.memory_percent:<8.1f} "
-              f"{metrics.commands_per_sec:<10.0f} {metrics.read_write_ratio:<12.2f} "
-              f"{metrics.connected_clients:<10.0f} {status_str:<20}")
-    
-    print("="*120 + "\n")
+        print("="*100 + "\n")
 
-def print_decisions(decisions: List[ScalingDecision]):
+def print_decisions(decisions: List[ScalingDecision], compact: bool = False):
     """Print scaling decisions"""
     if not decisions:
-        print("No scaling actions recommended - cluster is healthy\n")
+        if not compact:
+            print("No scaling actions recommended - cluster is healthy\n")
         return
     
-    print("\n" + "="*120)
-    print("SCALING RECOMMENDATIONS")
-    print("="*120)
-    
-    priority_names = {1: "🔴 CRITICAL", 2: "🟡 IMPORTANT", 3: "🟢 PREVENTIVE"}
-    
-    for decision in decisions:
-        print(f"\n{priority_names.get(decision.priority, '⚪ UNKNOWN')}")
-        print(f"  Action:  {decision.action.upper()}")
-        print(f"  Reason:  {decision.reason}")
-        print(f"  Targets: {', '.join(decision.target_pods)}")
-        print(f"  Time:    {decision.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    print("\n" + "="*120 + "\n")
+    if compact:
+        critical = sum(1 for d in decisions if d.priority == 1)
+        important = sum(1 for d in decisions if d.priority == 2)
+        print(f"Decisions: {len(decisions)} ({critical} critical, {important} important)")
+    else:
+        print("\n" + "="*100)
+        print("SCALING RECOMMENDATIONS")
+        print("="*100)
+        
+        priority_names = {1: "🔴 CRITICAL", 2: "🟡 IMPORTANT", 3: "🟢 PREVENTIVE"}
+        
+        for decision in decisions:
+            print(f"\n{priority_names.get(decision.priority, '⚪ UNKNOWN')}")
+            print(f"  Action:  {decision.action.upper()}")
+            print(f"  Reason:  {decision.reason}")
+            print(f"  Targets: {', '.join(decision.target_pods)}")
+            print(f"  Time:    {decision.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print("\n" + "="*100 + "\n")
 
-def export_to_json(pod_metrics: Dict[str, PodMetrics], decisions: List[ScalingDecision], filename: str = "scaling_decision.json"):
-    """Export metrics and decisions to JSON for further processing"""
-    data = {
+def save_decision_to_history(pod_metrics: Dict[str, PodMetrics], decisions: List[ScalingDecision]):
+    """Append current decision to history file"""
+    entry = {
         "timestamp": datetime.now().isoformat(),
         "pod_metrics": {
             pod_name: {
                 "cpu_percent": metrics.cpu_percent,
-                "memory_percent": metrics.memory_percent,
-                "commands_per_sec": metrics.commands_per_sec,
-                "read_commands_per_sec": metrics.read_commands_per_sec,
-                "write_commands_per_sec": metrics.write_commands_per_sec,
-                "read_write_ratio": metrics.read_write_ratio,
-                "connected_clients": metrics.connected_clients,
+                "memory_used_mb": metrics.memory_used_mb,
                 "is_high_load": metrics.is_high_load,
-                "is_read_heavy": metrics.is_read_heavy,
-                "is_write_heavy": metrics.is_write_heavy,
+                "is_cpu_constrained": metrics.is_cpu_constrained,
+                "is_memory_constrained": metrics.is_memory_constrained,
             }
             for pod_name, metrics in pod_metrics.items()
         },
-        "decisions": [
-            {
-                "action": d.action,
-                "reason": d.reason,
-                "target_pods": d.target_pods,
-                "priority": d.priority,
-                "timestamp": d.timestamp.isoformat()
-            }
-            for d in decisions
-        ]
+        "decisions": [d.to_dict() for d in decisions]
     }
     
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
+    # Load existing history
+    try:
+        with open(DECISION_HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        history = []
     
-    print(f"Exported data to {filename}\n")
+    # Append new entry
+    history.append(entry)
+    
+    # Keep only last 100 entries
+    history = history[-100:]
+    
+    # Save
+    with open(DECISION_HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
 
 def main():
-    """Main execution function"""
-    print("\nFetching Redis pod metrics from Prometheus...")
+    """Main execution function - continuous monitoring"""
+    print("="*100)
+    print("REDIS AUTOSCALER - CONTINUOUS MONITORING")
+    print("="*100)
+    print(f"Prometheus: {PROMETHEUS_URL}")
+    print(f"Check interval: {CHECK_INTERVAL_SECONDS} seconds")
+    print(f"History file: {DECISION_HISTORY_FILE}")
+    print("="*100 + "\n")
     
-    # Get metrics
-    pod_metrics = get_pod_metrics()
+    iteration = 0
     
-    if not pod_metrics:
-        print("No pod metrics found. Check:")
-        print("  1. Redis pods are running")
-        print("  2. Redis exporter is deployed and working")
-        print("  3. Prometheus is scraping metrics")
-        print("  4. Recording rules are applied")
-        return
-    
-    print(f"Found metrics for {len(pod_metrics)} pods\n")
-    
-    # Print summary
-    print_pod_summary(pod_metrics)
-    
-    # Run decision tree
-    print("Analyzing metrics and generating recommendations...")
-    decisions = decision_tree(pod_metrics)
-    
-    # Print decisions
-    print_decisions(decisions)
-    
-    # Export to JSON
-    export_to_json(pod_metrics, decisions)
-    
-    # Summary
-    if decisions:
-        critical = sum(1 for d in decisions if d.priority == 1)
-        important = sum(1 for d in decisions if d.priority == 2)
-        preventive = sum(1 for d in decisions if d.priority == 3)
+    while True:
+        iteration += 1
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        print(f"Summary: {len(decisions)} recommendations")
-        print(f"   - Critical: {critical}")
-        print(f"   - Important: {important}")
-        print(f"   - Preventive: {preventive}\n")
+        print(f"\n{'='*100}")
+        print(f"Iteration #{iteration} - {timestamp}")
+        print(f"{'='*100}")
+        
+        try:
+            # Fetch metrics
+            print("Fetching metrics from Prometheus...")
+            pod_metrics = get_pod_metrics()
+            
+            if not pod_metrics:
+                print("No metrics found. Retrying in next iteration...")
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
+            
+            # Print summary
+            print_pod_summary(pod_metrics, compact=False)
+            
+            # Run decision tree
+            decisions = decision_tree(pod_metrics)
+            
+            # Print decisions
+            print_decisions(decisions, compact=True)
+            
+            # Save to history
+            save_decision_to_history(pod_metrics, decisions)
+            
+            # If there are critical decisions, print full details
+            if any(d.priority == 1 for d in decisions):
+                print("\nCRITICAL DECISIONS DETECTED - Full details:")
+                print_decisions(decisions, compact=False)
+            
+            # Next check countdown
+            print(f"\n⏳ Next check in {CHECK_INTERVAL_SECONDS} seconds...")
+            
+            # Sleep
+            time.sleep(CHECK_INTERVAL_SECONDS)
+            
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"\nError in iteration: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"\n⏳ Retrying in {CHECK_INTERVAL_SECONDS} seconds...")
+            time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user\n")
+        print("\n\nStopped by user")
+        print(f"Decision history saved to {DECISION_HISTORY_FILE}\n")
     except Exception as e:
         print(f"\nError: {e}\n")
         import traceback

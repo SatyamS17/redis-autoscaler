@@ -1,0 +1,290 @@
+[
+  {
+    "timestamp": "2025-10-13T13:00:05.115360",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 2.4207758086504017,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 1.9609989613880732,
+        "memory_used_mb": 6.4375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.3842205638474128,
+        "memory_used_mb": 4.62109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 2.4247291056044125,
+        "memory_used_mb": 4.38671875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.6343081447109244,
+        "memory_used_mb": 4.609375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.0965363188945694,
+        "memory_used_mb": 4.5546875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  },
+  {
+    "timestamp": "2025-10-13T13:01:10.755964",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 2.488300061741104,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 2.4806575095699066,
+        "memory_used_mb": 7.48828125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.620542209181505,
+        "memory_used_mb": 4.37109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 2.4313230809731796,
+        "memory_used_mb": 4.38671875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.3755449904103396,
+        "memory_used_mb": 4.61328125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.4270048442559187,
+        "memory_used_mb": 8.20703125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  },
+  {
+    "timestamp": "2025-10-13T13:02:51.006668",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 2.523630859554163,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 2.3318326909890494,
+        "memory_used_mb": 4.90625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.507254781560579,
+        "memory_used_mb": 4.62109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 2.422354285092616,
+        "memory_used_mb": 4.38671875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.5177871540045365,
+        "memory_used_mb": 4.609375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.0183282603342074,
+        "memory_used_mb": 4.55078125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  },
+  {
+    "timestamp": "2025-10-13T13:03:02.338803",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 1.810719057412473,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 2.378672120371053,
+        "memory_used_mb": 4.90625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.4984548944337823,
+        "memory_used_mb": 4.37109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 2.608929472035668,
+        "memory_used_mb": 4.38671875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.1420817832132344,
+        "memory_used_mb": 4.609375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.048992196072617,
+        "memory_used_mb": 4.5546875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  },
+  {
+    "timestamp": "2025-10-13T13:03:13.704425",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 1.810719057412473,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 2.378672120371053,
+        "memory_used_mb": 4.90625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.4984548944337823,
+        "memory_used_mb": 4.37109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 2.608929472035668,
+        "memory_used_mb": 4.38671875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.1420817832132344,
+        "memory_used_mb": 4.609375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.048992196072617,
+        "memory_used_mb": 4.5546875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  },
+  {
+    "timestamp": "2025-10-13T13:04:25.717649",
+    "pod_metrics": {
+      "redis-redis-cluster-0": {
+        "cpu_percent": 2.371822833386638,
+        "memory_used_mb": 4.37890625,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-4": {
+        "cpu_percent": 2.4459640754266925,
+        "memory_used_mb": 4.65234375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-1": {
+        "cpu_percent": 2.43241474412292,
+        "memory_used_mb": 4.37109375,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-2": {
+        "cpu_percent": 1.9699724619268402,
+        "memory_used_mb": 4.3828125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-5": {
+        "cpu_percent": 2.4307914638386623,
+        "memory_used_mb": 4.61328125,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      },
+      "redis-redis-cluster-3": {
+        "cpu_percent": 2.388972128068403,
+        "memory_used_mb": 4.5546875,
+        "is_high_load": false,
+        "is_cpu_constrained": false,
+        "is_memory_constrained": false
+      }
+    },
+    "decisions": []
+  }
+]

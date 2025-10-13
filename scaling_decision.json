@@ -1,101 +1,47 @@
 {
-  "timestamp": "2025-10-12T21:33:28.435995",
+  "timestamp": "2025-10-13T12:55:54.267363",
   "pod_metrics": {
-    "redis-exporter-6f76d998d4-qmjns": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
+    "redis-redis-cluster-0": {
+      "cpu_percent": 2.315954868366064,
+      "memory_used_mb": 4.375,
       "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
     },
     "redis-redis-cluster-4": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
+      "cpu_percent": 2.52146031931691,
+      "memory_used_mb": 4.65625,
       "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
-    },
-    "redis-redis-cluster-5": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
-      "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
     },
     "redis-redis-cluster-1": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
+      "cpu_percent": 2.195981308412408,
+      "memory_used_mb": 4.37109375,
       "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
-    },
-    "redis-redis-cluster-0": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
-      "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
-    },
-    "redis-redis-cluster-3": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
-      "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
     },
     "redis-redis-cluster-2": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
+      "cpu_percent": 1.991929493853034,
+      "memory_used_mb": 4.3828125,
       "is_high_load": false,
-      "is_read_heavy": false,
-      "is_write_heavy": false
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
     },
-    "redis-benchmark": {
-      "cpu_percent": 0.0,
-      "memory_percent": 0.0,
-      "commands_per_sec": 0.0,
-      "read_commands_per_sec": 0.0,
-      "write_commands_per_sec": 0.0,
-      "read_write_ratio": 0.0,
-      "connected_clients": 0,
-      "is_high_load": 14.835974424101892,
-      "is_read_heavy": false,
-      "is_write_heavy": false
+    "redis-redis-cluster-5": {
+      "cpu_percent": 2.40926935109496,
+      "memory_used_mb": 4.609375,
+      "is_high_load": false,
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
+    },
+    "redis-redis-cluster-3": {
+      "cpu_percent": 2.519943304645748,
+      "memory_used_mb": 4.5546875,
+      "is_high_load": false,
+      "is_cpu_constrained": false,
+      "is_memory_constrained": false
     }
   },
   "decisions": []

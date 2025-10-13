@@ -2,16 +2,16 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: redis-exporter
-  namespace: default  # Change from redis to default
+  namespace: default
   labels:
     release: monitoring
 spec:
   selector:
     matchLabels:
-      app: redis-exporter
+      app.kubernetes.io/name: redis-redis-cluster
   namespaceSelector:
     matchNames:
-      - default  # Change from redis to default
+      - default
   endpoints:
-    - port: metrics
+    - port: http-metrics
       interval: 15s
