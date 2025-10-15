@@ -1,269 +1,667 @@
 {
-    "annotations": {
-        "list": []
-    },
-    "editable": true,
-    "gnetId": null,
-    "graphTooltip": 0,
-    "id": null,
-    "iteration": 1,
-    "links": [],
-    "panels": [
-        {
-            "type": "row",
-            "title": "Redis Cluster Overview",
-            "gridPos": {
-                "h": 1,
-                "w": 24,
-                "x": 0,
-                "y": 0
-            }
-        },
-        {
-            "type": "stat",
-            "title": "Total Commands/sec",
-            "targets": [
-                {
-                    "expr": "sum(rate(redis_commands_total[1m]))",
-                    "legendFormat": "Total Ops/sec"
-                }
-            ],
-            "gridPos": {
-                "h": 5,
-                "w": 6,
-                "x": 0,
-                "y": 1
-            }
-        },
-        {
-            "type": "stat",
-            "title": "Total CPU Usage (%)",
-            "targets": [
-                {
-                    "expr": "avg(rate(redis_cpu_sys_seconds_total[1m]) + rate(redis_cpu_user_seconds_total[1m])) * 100",
-                    "legendFormat": "CPU %"
-                }
-            ],
-            "gridPos": {
-                "h": 5,
-                "w": 6,
-                "x": 6,
-                "y": 1
-            }
-        },
-        {
-            "type": "stat",
-            "title": "Memory Usage (MB)",
-            "targets": [
-                {
-                    "expr": "sum(redis_memory_used_bytes) / 1024 / 1024",
-                    "legendFormat": "MB"
-                }
-            ],
-            "gridPos": {
-                "h": 5,
-                "w": 6,
-                "x": 12,
-                "y": 1
-            }
-        },
-        {
-            "type": "stat",
-            "title": "Connected Clients",
-            "targets": [
-                {
-                    "expr": "sum(redis_connected_clients)",
-                    "legendFormat": "Clients"
-                }
-            ],
-            "gridPos": {
-                "h": 5,
-                "w": 6,
-                "x": 18,
-                "y": 1
-            }
-        },
-        {
-            "type": "row",
-            "title": "Per-Node Metrics",
-            "gridPos": {
-                "h": 1,
-                "w": 24,
-                "x": 0,
-                "y": 6
-            }
-        },
-        {
-            "type": "timeseries",
-            "title": "CPU Usage per Redis Pod (%)",
-            "targets": [
-                {
-                    "expr": "sum(rate(container_cpu_usage_seconds_total{pod=~\"redis-redis-cluster-.*\", container=\"redis-redis-cluster\"}[1m])) by (pod) * 100",
-                    "legendFormat": "{{pod}}",
-                    "interval": ""
-                }
-            ],
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 7
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
             },
-            "fieldConfig": {
-                "defaults": {
-                    "unit": "percent"
-                }
-            }
-        },
-        {
-            "type": "timeseries",
-            "title": "Memory Usage per Redis Pod (MB)",
-            "targets": [
-                {
-                    "expr": "sum(container_memory_working_set_bytes{pod=~\"redis-redis-cluster-.*\", container=\"redis-redis-cluster\"}) by (pod) / 1024 / 1024",
-                    "legendFormat": "{{pod}}",
-                    "interval": ""
-                }
-            ],
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 12,
-                "y": 7
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
             },
-            "fieldConfig": {
-                "defaults": {
-                    "unit": "decmbytes"
-                }
-            }
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
         },
-        {
-            "type": "row",
-            "title": "Read/Write Workload Analysis",
-            "gridPos": {
-                "h": 1,
-                "w": 24,
-                "x": 0,
-                "y": 15
-            }
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": ["last", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
         },
-        {
-            "type": "timeseries",
-            "title": "Read vs Write Commands/sec",
-            "targets": [
-                {
-                    "expr": "sum(rate(redis_commands_total{cmd=~\"get|mget\"}[1m]))",
-                    "legendFormat": "Read",
-                    "interval": ""
-                },
-                {
-                    "expr": "sum(rate(redis_commands_total{cmd=~\"set|hset|incr|del\"}[1m]))",
-                    "legendFormat": "Write",
-                    "interval": ""
-                }
-            ],
-            "gridPos": {
-                "h": 8,
-                "w": 24,
-                "x": 0,
-                "y": 16
-            }
-        },
-        {
-            "type": "row",
-            "title": "I/O and Network",
-            "gridPos": {
-                "h": 1,
-                "w": 24,
-                "x": 0,
-                "y": 24
-            }
-        },
-        {
-            "type": "timeseries",
-            "title": "Network Input/Output per Pod (bytes/sec)",
-            "targets": [
-                {
-                    "expr": "rate(redis_net_input_bytes_total[1m])",
-                    "legendFormat": "{{pod}} input",
-                    "interval": ""
-                },
-                {
-                    "expr": "rate(redis_net_output_bytes_total[1m])",
-                    "legendFormat": "{{pod}} output",
-                    "interval": ""
-                }
-            ],
-            "gridPos": {
-                "h": 8,
-                "w": 24,
-                "x": 0,
-                "y": 25
-            }
-        },
-        {
-            "type": "row",
-            "title": "Top Load Table",
-            "gridPos": {
-                "h": 1,
-                "w": 24,
-                "x": 0,
-                "y": 33
-            }
-        },
-        {
-            "type": "table",
-            "title": "Redis Nodes by Command Rate",
-            "targets": [
-                {
-                    "expr": "sum(rate(redis_commands_total[1m])) by (pod)",
-                    "legendFormat": "{{pod}}",
-                    "interval": ""
-                }
-            ],
-            "gridPos": {
-                "h": 8,
-                "w": 24,
-                "x": 0,
-                "y": 34
-            }
+        "tooltip": {
+          "mode": "single"
         }
-    ],
-    "refresh": "30s",
-    "schemaVersion": 38,
-    "style": "dark",
-    "tags": [
-        "redis",
-        "autoscale"
-    ],
-    "templating": {
-        "list": [
-            {
-                "name": "namespace",
-                "type": "query",
-                "label": "Namespace",
-                "datasource": "Prometheus",
-                "query": "label_values(redis_memory_used_bytes, namespace)",
-                "includeAll": false,
-                "refresh": 1
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:cpu_percent:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage per Pod (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
             },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "decmbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": ["last", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:memory_used_mb:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage per Pod (MB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": ["last", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:read_ops_per_sec:by_pod",
+          "legendFormat": "{{pod}} - Reads",
+          "refId": "A"
+        },
+        {
+          "expr": "redis:write_ops_per_sec:by_pod",
+          "legendFormat": "{{pod}} - Writes",
+          "refId": "B"
+        }
+      ],
+      "title": "Read/Write Operations per Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": ["last", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:commands_per_sec:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Commands per Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": ["last", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:network_input_bytes_per_sec:by_pod",
+          "legendFormat": "{{pod}} - Input",
+          "refId": "A"
+        },
+        {
+          "expr": "redis:network_output_bytes_per_sec:by_pod",
+          "legendFormat": "{{pod}} - Output",
+          "refId": "B"
+        }
+      ],
+      "title": "Network Traffic per Pod",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 7,
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "text": {}
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:connected_clients:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Connected Clients per Pod",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": ["last", "mean"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:cache_hit_rate:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache Hit Rate per Pod",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": ["last", "mean"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:read_write_ratio:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Read/Write Ratio per Pod",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
             {
-                "name": "pod",
-                "type": "query",
-                "label": "Pod",
-                "datasource": "Prometheus",
-                "query": "label_values(redis_memory_used_bytes, pod)",
-                "includeAll": true,
-                "multi": true,
-                "refresh": 1
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "Normal"
+                },
+                "1": {
+                  "color": "red",
+                  "index": 1,
+                  "text": "High Load"
+                }
+              },
+              "type": "value"
             }
-        ]
-    },
-    "time": {
-        "from": "now-1h",
-        "to": "now"
-    },
-    "timezone": "browser",
-    "title": "Redis Cluster Load Overview (Bitnami)",
-    "version": 1
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "showUnfilled": true,
+        "text": {}
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "redis:is_high_load:by_pod",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Pod Load Status (1 = High Load)",
+      "type": "bargauge"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": ["redis", "cluster", "monitoring"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Redis Cluster Monitoring",
+  "uid": "redis-cluster-monitoring",
+  "version": 0
 }

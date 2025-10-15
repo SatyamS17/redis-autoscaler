@@ -21,6 +21,66 @@ spec:
       labels:
         metric_type: "memory"
 
+  # Per-pod Redis-specific metrics (read/write operations)
+  - name: redis-per-pod-operations
+    interval: 15s
+    rules:
+    # Total commands processed per second per pod
+    - record: redis:commands_per_sec:by_pod
+      expr: |
+        rate(redis_commands_processed_total{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Network input (read load) bytes per second per pod
+    - record: redis:network_input_bytes_per_sec:by_pod
+      expr: |
+        rate(redis_net_input_bytes_total{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "network"
+
+    # Network output (write load) bytes per second per pod
+    - record: redis:network_output_bytes_per_sec:by_pod
+      expr: |
+        rate(redis_net_output_bytes_total{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "network"
+
+    # Total reads processed (approximated by GET commands and similar)
+    - record: redis:read_ops_per_sec:by_pod
+      expr: |
+        rate(redis_total_reads_processed{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Total writes processed
+    - record: redis:write_ops_per_sec:by_pod
+      expr: |
+        rate(redis_total_writes_processed{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Connected clients per pod
+    - record: redis:connected_clients:by_pod
+      expr: |
+        redis_connected_clients{pod=~"redis-redis-cluster-.*"}
+      labels:
+        metric_type: "connections"
+
+    # Keyspace hits per second (cache hit rate indicator)
+    - record: redis:keyspace_hits_per_sec:by_pod
+      expr: |
+        rate(redis_keyspace_hits_total{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Keyspace misses per second
+    - record: redis:keyspace_misses_per_sec:by_pod
+      expr: |
+        rate(redis_keyspace_misses_total{pod=~"redis-redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
   # Cluster-wide aggregates
   - name: redis-cluster-aggregates
     interval: 15s
@@ -40,7 +100,29 @@ spec:
       labels:
         metric_type: "cluster_aggregate"
 
-  # Load classification based only on CPU/memory
+    # Total cluster-wide operations
+    - record: redis:total_commands_per_sec:cluster
+      expr: sum(redis:commands_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+
+    - record: redis:total_read_ops_per_sec:cluster
+      expr: sum(redis:read_ops_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+
+    - record: redis:total_write_ops_per_sec:cluster
+      expr: sum(redis:write_ops_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+
+    # Average operations per pod
+    - record: redis:avg_commands_per_sec:cluster
+      expr: avg(redis:commands_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+
+  # Load classification based on CPU/memory/operations
   - name: redis-load-classification
     interval: 15s
     rules:
@@ -52,15 +134,49 @@ spec:
 
     # Classify pod as memory constrained (> 80%)
     - record: redis:is_memory_constrained:by_pod
-      expr: redis:memory_used_mb:by_pod / (1024 * 1024) > 80  # optional: adjust if you know pod memory limits
+      expr: redis:memory_used_mb:by_pod / (1024 * 1024) > 80
       labels:
         metric_type: "classification"
 
-    # High load indicator (CPU or memory)
+    # High operations load (> 1000 commands/sec)
+    - record: redis:is_high_ops_load:by_pod
+      expr: redis:commands_per_sec:by_pod > 1000
+      labels:
+        metric_type: "classification"
+
+    # High network load (> 10 MB/s combined in+out)
+    - record: redis:is_high_network_load:by_pod
+      expr: |
+        (redis:network_input_bytes_per_sec:by_pod + redis:network_output_bytes_per_sec:by_pod) > 10485760
+      labels:
+        metric_type: "classification"
+
+    # High load indicator (CPU, memory, or operations)
     - record: redis:is_high_load:by_pod
       expr: |
         (redis:cpu_percent:by_pod > 12) 
         or 
         (redis:memory_used_mb:by_pod / (1024 * 1024) > 80)
+        or
+        (redis:commands_per_sec:by_pod > 1000)
       labels:
         metric_type: "classification"
+
+  # Read/Write ratio and balance metrics
+  - name: redis-workload-analysis
+    interval: 15s
+    rules:
+    # Read/Write ratio per pod
+    - record: redis:read_write_ratio:by_pod
+      expr: |
+        redis:read_ops_per_sec:by_pod / (redis:write_ops_per_sec:by_pod + 0.001)
+      labels:
+        metric_type: "workload"
+
+    # Cache hit rate per pod (hits / (hits + misses))
+    - record: redis:cache_hit_rate:by_pod
+      expr: |
+        redis:keyspace_hits_per_sec:by_pod / 
+        (redis:keyspace_hits_per_sec:by_pod + redis:keyspace_misses_per_sec:by_pod + 0.001)
+      labels:
+        metric_type: "workload"

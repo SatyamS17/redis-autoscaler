@@ -6,6 +6,7 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from kubernetes import client, config
+import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -14,12 +15,16 @@ class RedisAutoscaler:
     def __init__(self):
         self.namespace = "default"
         self.redis_cluster_name = "redis-redis-cluster"
-        self.redis_password = os.getenv('REDIS_PASSWORD', 'PK1QCCFHGp')
+        self.redis_password = os.getenv('REDIS_PASSWORD', 'HIYCPE8NtO')
         self.upscale_threshold = float(os.getenv('UPSCALE_CPU_THRESHOLD', '10.0'))
         self.downscale_threshold = float(os.getenv('DOWNSCALE_CPU_THRESHOLD', '5.0'))
         self.cooldown_minutes = int(os.getenv('COOLDOWN_MINUTES', '1'))
         self.check_interval = int(os.getenv('CHECK_INTERVAL_SECONDS', '30'))
-        
+        self.prometheus_url = os.getenv(
+            'PROMETHEUS_URL', 
+            'http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090'
+        )
+
         # Ensure minimum 3 masters + 3 replicas = 6 nodes minimum
         self.min_masters = 3
         self.min_replicas = 3
@@ -64,6 +69,45 @@ class RedisAutoscaler:
         # Test Redis connection at startup
         self.test_redis_setup()
 
+    # Add new method to query Prometheus
+    def query_prometheus(self, query: str) -> list:
+        """Query Prometheus and return results"""
+        try:
+            response = requests.get(
+                f"{self.prometheus_url}/api/v1/query",
+                params={"query": query},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data["status"] == "success":
+                return data["data"]["result"]
+            else:
+                logger.warning(f"Prometheus query failed: {data}")
+                return []
+        except Exception as e:
+            logger.error(f"Error querying Prometheus: {e}")
+            return []
+
+    # Replace get_pod_cpu_usage method
+    def get_pod_cpu_usage(self, pod_name: str) -> Optional[float]:
+        """Get CPU usage percentage for a pod from Prometheus"""
+        try:
+            query = f'redis:cpu_percent:by_pod{{pod="{pod_name}"}}'
+            results = self.query_prometheus(query)
+            
+            if results:
+                cpu_value = float(results[0]["value"][1])
+                return cpu_value
+            else:
+                logger.debug(f"No CPU metrics found for {pod_name} in Prometheus")
+                return None
+                
+        except Exception as e:
+            logger.debug(f"Could not get CPU metrics for {pod_name}: {e}")
+            return None
+    
     def get_redis_pods(self) -> List[Dict]:
         """Get all Redis pods by name pattern"""
         try:
@@ -83,28 +127,6 @@ class RedisAutoscaler:
         except Exception as e:
             logger.error(f"Error getting Redis pods: {e}")
             return []
-
-    def get_pod_cpu_usage(self, pod_name: str) -> Optional[float]:
-        """Get CPU usage percentage for a pod"""
-        if not self.metrics_available:
-            return None
-            
-        try:
-            metrics = self.k8s_metrics.get_namespaced_custom_object(
-                group="metrics.k8s.io",
-                version="v1beta1",
-                namespace=self.namespace,
-                plural="pods",
-                name=pod_name
-            )
-            
-            cpu_usage = metrics['containers'][0]['usage']['cpu']
-            cpu_cores = int(cpu_usage.rstrip('n')) / 1_000_000_000
-            return min(cpu_cores * 100, 100.0)
-            
-        except Exception as e:
-            logger.debug(f"Could not get CPU metrics for {pod_name}: {e}")
-            return None
 
     def update_cpu_history(self, pod_name: str, cpu_usage: float):
         """Track CPU usage history for scaling decisions"""
@@ -1253,49 +1275,43 @@ class RedisAutoscaler:
                     continue
                 
                 # Monitor CPU and make scaling decisions
-                if self.metrics_available:
-                    high_cpu = 0
-                    low_cpu = 0
-                    
-                    for pod in pods:  # Check first 6
-                        cpu = self.get_pod_cpu_usage(pod['name'])
-                        if cpu is not None:
-                            icon = "🔥" if cpu > self.upscale_threshold else "❄️" if cpu < self.downscale_threshold else "✅"
-                            logger.info(f"   {icon} {pod['name']}: {cpu:.1f}%")
-                            
-                            if cpu > self.upscale_threshold:
-                                high_cpu += 1
-                            elif cpu < self.downscale_threshold:
-                                low_cpu += 1
-                        else:
-                            logger.info(f"   📊 {pod['name']}: No CPU metrics")
-                    
-                    # Scaling decisions
-                    if not self.is_in_cooldown():
-                        if self.should_scale_up(pods):
-                            logger.info("🚀 SCALING UP: Adding master-replica pair")
-                            if self.scale_up(current_count):
-                                logger.info("✅ Scale-up completed")
-                            else:
-                                logger.error("❌ Scale-up failed")
+                high_cpu = 0
+                low_cpu = 0
+                for pod in pods:
+                    cpu = self.get_pod_cpu_usage(pod['name'])
+                    if cpu is not None:
+                        icon = "🔥" if cpu > self.upscale_threshold else "❄️" if cpu < self.downscale_threshold else "✅"
+                        logger.info(f"   {icon} {pod['name']}: {cpu:.1f}%")
                         
-                        else:
-                            nodes_to_remove = self.should_scale_down(pods)
-                            if nodes_to_remove:
-                                logger.info(f"🔽 SCALING DOWN: Removing {len(nodes_to_remove)} nodes: {nodes_to_remove}")
-                                if self.scale_down(nodes_to_remove, current_count):
-                                    logger.info("✅ Scale-down completed")
-                                else:
-                                    logger.error("❌ Scale-down failed")
-                            else:
-                                logger.info("😌 Cluster load is stable")
+                        if cpu > self.upscale_threshold:
+                            high_cpu += 1
+                        elif cpu < self.downscale_threshold:
+                            low_cpu += 1
                     else:
-                        remaining = self.cooldown_minutes - ((datetime.now() - self.last_scale_time).seconds // 60)
-                        logger.info(f"⏸️ In cooldown ({remaining}min remaining)")
+                        logger.info(f"   📊 {pod['name']}: No CPU metrics")
                 
+                # Scaling decisions
+                if not self.is_in_cooldown():
+                    if self.should_scale_up(pods):
+                        logger.info("🚀 SCALING UP: Adding master-replica pair")
+                        if self.scale_up(current_count):
+                            logger.info("✅ Scale-up completed")
+                        else:
+                            logger.error("❌ Scale-up failed")
+                    
+                    else:
+                        nodes_to_remove = self.should_scale_down(pods)
+                        if nodes_to_remove:
+                            logger.info(f"🔽 SCALING DOWN: Removing {len(nodes_to_remove)} nodes: {nodes_to_remove}")
+                            if self.scale_down(nodes_to_remove, current_count):
+                                logger.info("✅ Scale-down completed")
+                            else:
+                                logger.error("❌ Scale-down failed")
+                        else:
+                            logger.info("😌 Cluster load is stable")
                 else:
-                    logger.info("📊 CPU metrics not available - monitoring only")
-                
+                    remaining = self.cooldown_minutes - ((datetime.now() - self.last_scale_time).seconds // 60)
+                    logger.info(f"⏸️ In cooldown ({remaining}min remaining)")
             except Exception as e:
                 logger.error(f"❌ Error in monitoring loop: {e}")
                 import traceback

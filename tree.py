@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Redis Cluster Scaling Decision Engine - Continuous Monitoring Mode
+Redis Cluster Scaling Decision Engine - Enhanced with Read/Write Load Analysis
 
-Queries Prometheus for per-pod CPU and memory metrics only.
-Works without redis-exporter, using only container metrics.
+Queries Prometheus for per-pod CPU, memory, and read/write operation metrics.
+Follows the decision tree logic to make scaling decisions.
 Runs continuously and makes periodic scaling decisions.
 """
 
@@ -12,35 +12,84 @@ import json
 import time
 import sys
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # Configuration
 PROMETHEUS_URL = "http://localhost:9090"
 CHECK_INTERVAL_SECONDS = 10
 DECISION_HISTORY_FILE = "scaling_decisions_history.json"
 
+# Thresholds (from decision tree)
+CPU_THRESHOLD = 12  # CPU > 12% for 1+ min
+MEMORY_THRESHOLD_PERCENT = 80  # Memory > 80% for 1+ min
+CPU_SCALE_THRESHOLD = 5  # CPU > 5% & Memory < 80% for 1+ min
+MEMORY_SCALE_THRESHOLD_PERCENT = 80  # Memory > 80% & CPU < 5% for 1+ min
+READ_HEAVY_THRESHOLD = 0.90  # read/(read+write) > 70%
+WRITE_HEAVY_THRESHOLD = 0.40  # write/(read+write) > 70%
+MIN_OPS_THRESHOLD = 100
+
 class PodMetrics:
     def __init__(self, pod_name: str):
         self.pod_name = pod_name
         self.cpu_percent = 0.0
         self.memory_used_mb = 0.0
+        self.read_ops_per_sec = 0.0
+        self.write_ops_per_sec = 0.0
+        self.commands_per_sec = 0.0
+        self.connected_clients = 0
+        self.network_input_bytes_per_sec = 0.0
+        self.network_output_bytes_per_sec = 0.0
+        
+        # Calculated properties
+        self.total_ops = 0.0
+        self.read_ratio = 0.0
+        self.write_ratio = 0.0
+        self.workload_type = "UNKNOWN"  # READ-HEAVY, WRITE-HEAVY, BALANCED
+        
+        # Status flags
         self.is_high_load = False
         self.is_cpu_constrained = False
         self.is_memory_constrained = False
 
+    def calculate_derived_metrics(self):
+        """Calculate workload ratios and type"""
+        self.total_ops = self.read_ops_per_sec + self.write_ops_per_sec
+        
+        if self.total_ops > MIN_OPS_THRESHOLD:
+            self.read_ratio = self.read_ops_per_sec / self.total_ops
+            self.write_ratio = self.write_ops_per_sec / self.total_ops
+            
+            # Determine workload type
+            if self.read_ratio >= READ_HEAVY_THRESHOLD:
+                self.workload_type = "READ-HEAVY"
+            elif self.write_ratio >= WRITE_HEAVY_THRESHOLD:
+                self.workload_type = "WRITE-HEAVY"
+            else:
+                self.workload_type = "BALANCED"
+        else:
+            # Low traffic - don't classify
+            self.read_ratio = 0.0
+            self.write_ratio = 0.0
+            self.workload_type = "IDLE"  # or "LOW-TRAFFIC"
+        
+        # Set constraint flags
+        self.is_cpu_constrained = self.cpu_percent > CPU_THRESHOLD
+        self.is_memory_constrained = self.memory_used_mb > 800
+        self.is_high_load = self.is_cpu_constrained or self.is_memory_constrained
     def __repr__(self):
-        return f"PodMetrics({self.pod_name})"
+        return f"PodMetrics({self.pod_name}, workload={self.workload_type})"
 
 class ScalingDecision:
-    def __init__(self, action: str, reason: str, target_pods: List[str], priority: int):
-        self.action = action  # "scale_horizontal", "scale_vertical", "no_action"
+    def __init__(self, action: str, reason: str, target_pods: List[str], priority: int, details: Optional[Dict] = None):
+        self.action = action  # "scale_horizontal_out", "scale_vertical_up", "scale_down", "no_action"
         self.reason = reason
         self.target_pods = target_pods
-        self.priority = priority  # 1=critical, 2=important, 3=nice-to-have
+        self.priority = priority  # 1=critical, 2=important, 3=preventive
+        self.details = details or {}
         self.timestamp = datetime.now()
 
     def __repr__(self):
-        return f"ScalingDecision(action={self.action}, priority={self.priority}, targets={self.target_pods})"
+        return f"ScalingDecision(action={self.action}, priority={self.priority}, targets={len(self.target_pods)} pods)"
     
     def to_dict(self):
         return {
@@ -48,6 +97,7 @@ class ScalingDecision:
             "reason": self.reason,
             "target_pods": self.target_pods,
             "priority": self.priority,
+            "details": self.details,
             "timestamp": self.timestamp.isoformat()
         }
 
@@ -75,27 +125,30 @@ def get_pod_metrics() -> Dict[str, PodMetrics]:
     """Fetch all relevant metrics for each Redis pod"""
     pods = {}
     
-    # Try recording rules first, fall back to raw queries
-    test_query = query_prometheus("redis:cpu_percent:by_pod")
-    use_recording_rules = len(test_query) > 0
-    
-    if use_recording_rules:
-        queries = {
-            "cpu_percent": "redis:cpu_percent:by_pod",
-            "memory_used_mb": "redis:memory_used_mb:by_pod",
-            "is_high_load": "redis:is_high_load:by_pod",
-            "is_cpu_constrained": "redis:is_cpu_constrained:by_pod",
-            "is_memory_constrained": "redis:is_memory_constrained:by_pod",
-        }
-    else:
-        queries = {
-            "cpu_percent": 'sum(rate(container_cpu_usage_seconds_total{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}[1m])) by (pod) * 100',
-            "memory_used_mb": 'sum(container_memory_working_set_bytes{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}) by (pod) / 1024 / 1024',
-        }
+    # Define queries - try recording rules first
+    queries = {
+        "cpu_percent": "redis:cpu_percent:by_pod",
+        "memory_used_mb": "redis:memory_used_mb:by_pod",
+        "read_ops_per_sec": "redis:read_ops_per_sec:by_pod",
+        "write_ops_per_sec": "redis:write_ops_per_sec:by_pod",
+        "commands_per_sec": "redis:commands_per_sec:by_pod",
+        "connected_clients": "redis:connected_clients:by_pod",
+        "network_input_bytes_per_sec": "redis:network_input_bytes_per_sec:by_pod",
+        "network_output_bytes_per_sec": "redis:network_output_bytes_per_sec:by_pod",
+    }
     
     # Fetch metrics
     for metric_name, query in queries.items():
         results = query_prometheus(query)
+        
+        if not results and metric_name in ["cpu_percent", "memory_used_mb"]:
+            # Fallback to raw queries for basic metrics
+            fallback_queries = {
+                "cpu_percent": 'sum(rate(container_cpu_usage_seconds_total{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}[1m])) by (pod) * 100',
+                "memory_used_mb": 'sum(container_memory_working_set_bytes{pod=~"redis-redis-cluster-.*",container="redis-redis-cluster"}) by (pod) / 1024 / 1024',
+            }
+            if metric_name in fallback_queries:
+                results = query_prometheus(fallback_queries[metric_name])
         
         for result in results:
             pod_name = result["metric"].get("pod", "unknown")
@@ -106,61 +159,136 @@ def get_pod_metrics() -> Dict[str, PodMetrics]:
                 pods[pod_name] = PodMetrics(pod_name)
             
             # Set metric value
-            if metric_name.startswith("is_"):
-                setattr(pods[pod_name], metric_name, bool(value))
-            else:
-                setattr(pods[pod_name], metric_name, value)
+            setattr(pods[pod_name], metric_name, value)
     
-    # Calculate derived metrics if using raw queries
-    if not use_recording_rules:
-        for pod_name, metrics in pods.items():
-            metrics.is_cpu_constrained = metrics.cpu_percent > 12
-            metrics.is_memory_constrained = metrics.memory_used_mb > 800
-            metrics.is_high_load = metrics.is_cpu_constrained or metrics.is_memory_constrained
+    # Calculate derived metrics for all pods
+    for pod in pods.values():
+        pod.calculate_derived_metrics()
     
     return pods
 
 def decision_tree(pod_metrics: Dict[str, PodMetrics]) -> List[ScalingDecision]:
     """
-    Simplified decision tree based only on CPU and memory
+    Enhanced decision tree following the provided flowchart
     
-    Decision Flow:
-    1. Check for critical CPU constraint (> 12%)
-    2. Check for critical memory constraint (> 80%)
-    3. Check for sustained high load
-    4. Cluster-wide analysis
+    Decision Flow (per pod):
+    1. Memory > 80% for 1+ min? → YES: Can we scale up? → YES: Scale memory vertically | NO: Add shard and redistribute slots
+    2. CPU > 12% for 1+ min? → YES: Can we scale up? → YES: Scale CPU vertically | NO: depends on workload
+    3. CPU > 5% & Memory < 80% for 1+ min? → Check workload type
+        - READ-HEAVY (reads > 70%): Add read replicas/follower
+        - WRITE-HEAVY (writes > 40%): Add shard and redistribute slots
+    4. Safe to scale down? Check if underutilized
     """
     decisions = []
     
     # Analyze each pod
     for pod_name, metrics in pod_metrics.items():
         
-        # CRITICAL: CPU Constraint
+        # CRITICAL PATH 1: Memory > 80%
+        if metrics.is_memory_constrained:
+            decisions.append(ScalingDecision(
+                action="scale_vertical_up",
+                reason=f"Memory constraint: {metrics.memory_used_mb:.0f} MB (>{MEMORY_THRESHOLD_PERCENT}%)",
+                target_pods=[pod_name],
+                priority=1,
+                details={
+                    "memory_mb": metrics.memory_used_mb,
+                    "cpu_percent": metrics.cpu_percent,
+                    "scaling_type": "memory"
+                }
+            ))
+            continue  # Skip other checks for this pod
+        
+        # CRITICAL PATH 2: CPU > 12%
         if metrics.is_cpu_constrained:
-            decisions.append(ScalingDecision(
-                action="scale_horizontal",
-                reason=f"{pod_name}: CPU {metrics.cpu_percent:.1f}% exceeds threshold (12%)",
-                target_pods=[pod_name],
-                priority=1
-            ))
-        
-        # CRITICAL: Memory Constraint
-        elif metrics.is_memory_constrained:
-            decisions.append(ScalingDecision(
-                action="scale_vertical",
-                reason=f"{pod_name}: Memory {metrics.memory_used_mb:.0f} MB near limit",
-                target_pods=[pod_name],
-                priority=1
-            ))
-        
-        # HIGH LOAD: Both CPU and memory elevated (but not critical)
-        elif metrics.is_high_load:
-            if metrics.cpu_percent > 8:  # Approaching CPU threshold
+            # Check if we can scale vertically or need horizontal
+            # Assumption: if memory is low, we can scale CPU vertically
+            # Need horizontal scaling based on workload
+            if metrics.workload_type == "READ-HEAVY":
                 decisions.append(ScalingDecision(
-                    action="scale_horizontal",
-                    reason=f"{pod_name}: High load - CPU {metrics.cpu_percent:.1f}%",
+                    action="scale_horizontal_add_replica",
+                    reason=f"CPU {metrics.cpu_percent:.1f}% + READ-HEAVY workload ({metrics.read_ratio*100:.0f}% reads)",
                     target_pods=[pod_name],
-                    priority=2
+                    priority=1,
+                    details={
+                        "cpu_percent": metrics.cpu_percent,
+                        "workload": metrics.workload_type,
+                        "read_ratio": metrics.read_ratio,
+                        "read_ops": metrics.read_ops_per_sec
+                    }
+                ))
+            else:  # WRITE-HEAVY or BALANCED
+                decisions.append(ScalingDecision(
+                    action="scale_horizontal_add_shard",
+                    reason=f"CPU {metrics.cpu_percent:.1f}% + {metrics.workload_type} workload ({metrics.write_ratio*100:.0f}% writes)",
+                    target_pods=[pod_name],
+                    priority=1,
+                    details={
+                        "cpu_percent": metrics.cpu_percent,
+                        "workload": metrics.workload_type,
+                        "write_ratio": metrics.write_ratio,
+                        "write_ops": metrics.write_ops_per_sec
+                    }
+                ))
+            continue
+        
+        # IMPORTANT PATH: CPU > 5% but < 12%
+        if metrics.cpu_percent > CPU_SCALE_THRESHOLD and metrics.cpu_percent <= CPU_THRESHOLD:
+            if metrics.memory_used_mb < 600:  # Memory is OK
+                # Analyze workload type
+                if metrics.workload_type == "READ-HEAVY":
+                    decisions.append(ScalingDecision(
+                        action="scale_horizontal_add_replica",
+                        reason=f"Elevated CPU {metrics.cpu_percent:.1f}% + READ-HEAVY ({metrics.read_ratio*100:.0f}% reads)",
+                        target_pods=[pod_name],
+                        priority=2,
+                        details={
+                            "cpu_percent": metrics.cpu_percent,
+                            "workload": metrics.workload_type,
+                            "read_ops": metrics.read_ops_per_sec,
+                            "commands_per_sec": metrics.commands_per_sec
+                        }
+                    ))
+                elif metrics.workload_type == "WRITE-HEAVY":
+                    decisions.append(ScalingDecision(
+                        action="scale_horizontal_add_shard",
+                        reason=f"Elevated CPU {metrics.cpu_percent:.1f}% + WRITE-HEAVY ({metrics.write_ratio*100:.0f}% writes)",
+                        target_pods=[pod_name],
+                        priority=2,
+                        details={
+                            "cpu_percent": metrics.cpu_percent,
+                            "workload": metrics.workload_type,
+                            "write_ops": metrics.write_ops_per_sec,
+                            "commands_per_sec": metrics.commands_per_sec
+                        }
+                    ))
+        
+        # SCALE DOWN PATH: Check if pod is significantly underutilized
+        if metrics.cpu_percent < 2 and metrics.memory_used_mb < 200 and metrics.total_ops < 10:
+            # Check if this is a read-heavy workload with replica
+            if metrics.workload_type == "READ-HEAVY":
+                decisions.append(ScalingDecision(
+                    action="scale_down_remove_replica",
+                    reason=f"Underutilized replica: CPU {metrics.cpu_percent:.1f}%, {metrics.total_ops:.0f} ops/sec",
+                    target_pods=[pod_name],
+                    priority=3,
+                    details={
+                        "cpu_percent": metrics.cpu_percent,
+                        "memory_mb": metrics.memory_used_mb,
+                        "total_ops": metrics.total_ops
+                    }
+                ))
+            elif metrics.workload_type == "WRITE-HEAVY" or metrics.workload_type == "BALANCED":
+                decisions.append(ScalingDecision(
+                    action="scale_down_remove_shard",
+                    reason=f"Underutilized: CPU {metrics.cpu_percent:.1f}%, {metrics.total_ops:.0f} ops/sec",
+                    target_pods=[pod_name],
+                    priority=3,
+                    details={
+                        "cpu_percent": metrics.cpu_percent,
+                        "memory_mb": metrics.memory_used_mb,
+                        "total_ops": metrics.total_ops
+                    }
                 ))
     
     # Cluster-wide analysis
@@ -169,24 +297,50 @@ def decision_tree(pod_metrics: Dict[str, PodMetrics]) -> List[ScalingDecision]:
         high_load_pods = sum(1 for m in pod_metrics.values() if m.is_high_load)
         cpu_constrained_pods = sum(1 for m in pod_metrics.values() if m.is_cpu_constrained)
         avg_cpu = sum(m.cpu_percent for m in pod_metrics.values()) / total_pods
+        avg_memory = sum(m.memory_used_mb for m in pod_metrics.values()) / total_pods
+        total_read_ops = sum(m.read_ops_per_sec for m in pod_metrics.values())
+        total_write_ops = sum(m.write_ops_per_sec for m in pod_metrics.values())
         
-        # If majority of pods are CPU constrained
+        # Cluster-wide workload type
+        total_ops = total_read_ops + total_write_ops
+        cluster_workload = "UNKNOWN"
+        if total_ops > 0:
+            cluster_read_ratio = total_read_ops / total_ops
+            if cluster_read_ratio >= READ_HEAVY_THRESHOLD:
+                cluster_workload = "READ-HEAVY"
+            elif (total_write_ops / total_ops) >= WRITE_HEAVY_THRESHOLD:
+                cluster_workload = "WRITE-HEAVY"
+            else:
+                cluster_workload = "BALANCED"
+        
+        # If majority of pods are constrained
         if cpu_constrained_pods >= total_pods * 0.5:
-            decisions.append(ScalingDecision(
-                action="scale_horizontal",
-                reason=f"Cluster-wide: {cpu_constrained_pods}/{total_pods} pods CPU constrained, avg CPU {avg_cpu:.1f}%",
-                target_pods=list(pod_metrics.keys()),
-                priority=1
-            ))
-        
-        # If majority of pods under high load
-        elif high_load_pods >= total_pods * 0.6:
-            decisions.append(ScalingDecision(
-                action="scale_horizontal",
-                reason=f"Cluster-wide: {high_load_pods}/{total_pods} pods under high load, avg CPU {avg_cpu:.1f}%",
-                target_pods=list(pod_metrics.keys()),
-                priority=2
-            ))
+            if cluster_workload == "READ-HEAVY":
+                decisions.append(ScalingDecision(
+                    action="scale_horizontal_add_replica",
+                    reason=f"Cluster-wide: {cpu_constrained_pods}/{total_pods} pods CPU constrained, {cluster_workload} workload",
+                    target_pods=list(pod_metrics.keys()),
+                    priority=1,
+                    details={
+                        "avg_cpu": avg_cpu,
+                        "cluster_workload": cluster_workload,
+                        "total_read_ops": total_read_ops,
+                        "total_write_ops": total_write_ops
+                    }
+                ))
+            else:
+                decisions.append(ScalingDecision(
+                    action="scale_horizontal_add_shard",
+                    reason=f"Cluster-wide: {cpu_constrained_pods}/{total_pods} pods CPU constrained, {cluster_workload} workload",
+                    target_pods=list(pod_metrics.keys()),
+                    priority=1,
+                    details={
+                        "avg_cpu": avg_cpu,
+                        "cluster_workload": cluster_workload,
+                        "total_read_ops": total_read_ops,
+                        "total_write_ops": total_write_ops
+                    }
+                ))
     
     # Sort by priority (critical first)
     decisions.sort(key=lambda d: d.priority)
@@ -196,17 +350,17 @@ def decision_tree(pod_metrics: Dict[str, PodMetrics]) -> List[ScalingDecision]:
 def print_pod_summary(pod_metrics: Dict[str, PodMetrics], compact: bool = False):
     """Print a summary table of pod metrics"""
     if compact:
-        # Compact one-line summary
         total = len(pod_metrics)
         avg_cpu = sum(m.cpu_percent for m in pod_metrics.values()) / total if total > 0 else 0
         max_cpu = max((m.cpu_percent for m in pod_metrics.values()), default=0)
         high_load = sum(1 for m in pod_metrics.values() if m.is_high_load)
-        print(f"Pods: {total} | Avg CPU: {avg_cpu:.1f}% | Max CPU: {max_cpu:.1f}% | High Load: {high_load}/{total}")
+        total_ops = sum(m.total_ops for m in pod_metrics.values())
+        print(f"Pods: {total} | Avg CPU: {avg_cpu:.1f}% | Max CPU: {max_cpu:.1f}% | High Load: {high_load}/{total} | Total Ops: {total_ops:.0f}/sec")
     else:
         print("\n" + "="*100)
         print("REDIS POD METRICS SUMMARY")
         print("="*100)
-        print(f"{'Pod Name':<30} {'CPU%':<10} {'Memory (MB)':<15} {'Status':<30}")
+        print(f"{'Pod Name':<30} {'CPU%':<8} {'Mem(MB)':<10} {'Workload':<12} {'Read/s':<10} {'Write/s':<10} {'Status':<30}")
         print("-"*100)
         
         for pod_name, metrics in sorted(pod_metrics.items()):
@@ -214,13 +368,15 @@ def print_pod_summary(pod_metrics: Dict[str, PodMetrics], compact: bool = False)
             if metrics.is_high_load:
                 status.append("HIGH_LOAD")
             if metrics.is_cpu_constrained:
-                status.append("CPU_CONSTRAINED")
+                status.append("CPU")
             if metrics.is_memory_constrained:
-                status.append("MEMORY_CONSTRAINED")
+                status.append("MEM")
             
-            status_str = ", ".join(status) if status else "OK"
+            status_str = " ".join(status) if status else "✅ OK"
             
-            print(f"{pod_name:<30} {metrics.cpu_percent:<10.2f} {metrics.memory_used_mb:<15.0f} {status_str:<30}")
+            print(f"{pod_name:<30} {metrics.cpu_percent:<8.2f} {metrics.memory_used_mb:<10.0f} "
+                  f"{metrics.workload_type:<12} {metrics.read_ops_per_sec:<10.0f} "
+                  f"{metrics.write_ops_per_sec:<10.0f} {status_str:<30}")
         
         print("="*100 + "\n")
 
@@ -234,19 +390,22 @@ def print_decisions(decisions: List[ScalingDecision], compact: bool = False):
     if compact:
         critical = sum(1 for d in decisions if d.priority == 1)
         important = sum(1 for d in decisions if d.priority == 2)
-        print(f"Decisions: {len(decisions)} ({critical} critical, {important} important)")
+        preventive = sum(1 for d in decisions if d.priority == 3)
+        print(f"Decisions: {len(decisions)} total ({critical} critical, {important} important, {preventive} preventive)")
     else:
         print("\n" + "="*100)
         print("SCALING RECOMMENDATIONS")
         print("="*100)
         
-        priority_names = {1: "🔴 CRITICAL", 2: "🟡 IMPORTANT", 3: "🟢 PREVENTIVE"}
+        priority_icons = {1: "CRITICAL", 2: "IMPORTANT", 3: "PREVENTIVE"}
         
         for decision in decisions:
-            print(f"\n{priority_names.get(decision.priority, '⚪ UNKNOWN')}")
+            print(f"\n{priority_icons.get(decision.priority, 'UNKNOWN')}")
             print(f"  Action:  {decision.action.upper()}")
             print(f"  Reason:  {decision.reason}")
-            print(f"  Targets: {', '.join(decision.target_pods)}")
+            print(f"  Targets: {', '.join(decision.target_pods[:3])}{'...' if len(decision.target_pods) > 3 else ''} ({len(decision.target_pods)} pods)")
+            if decision.details:
+                print(f"  Details: {json.dumps(decision.details, indent=11)}")
             print(f"  Time:    {decision.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
         
         print("\n" + "="*100 + "\n")
@@ -259,6 +418,9 @@ def save_decision_to_history(pod_metrics: Dict[str, PodMetrics], decisions: List
             pod_name: {
                 "cpu_percent": metrics.cpu_percent,
                 "memory_used_mb": metrics.memory_used_mb,
+                "read_ops_per_sec": metrics.read_ops_per_sec,
+                "write_ops_per_sec": metrics.write_ops_per_sec,
+                "workload_type": metrics.workload_type,
                 "is_high_load": metrics.is_high_load,
                 "is_cpu_constrained": metrics.is_cpu_constrained,
                 "is_memory_constrained": metrics.is_memory_constrained,
@@ -288,11 +450,12 @@ def save_decision_to_history(pod_metrics: Dict[str, PodMetrics], decisions: List
 def main():
     """Main execution function - continuous monitoring"""
     print("="*100)
-    print("REDIS AUTOSCALER - CONTINUOUS MONITORING")
+    print("REDIS AUTOSCALER - CONTINUOUS MONITORING WITH READ/WRITE ANALYSIS")
     print("="*100)
     print(f"Prometheus: {PROMETHEUS_URL}")
     print(f"Check interval: {CHECK_INTERVAL_SECONDS} seconds")
     print(f"History file: {DECISION_HISTORY_FILE}")
+    print(f"Thresholds: CPU={CPU_THRESHOLD}%, Memory={MEMORY_THRESHOLD_PERCENT}%, Read-Heavy={READ_HEAVY_THRESHOLD*100:.0f}%")
     print("="*100 + "\n")
     
     iteration = 0
@@ -301,7 +464,7 @@ def main():
         iteration += 1
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        print(f"\n{'='*100}")
+        print(f"\n{'='*199}")
         print(f"Iteration #{iteration} - {timestamp}")
         print(f"{'='*100}")
         
@@ -333,7 +496,7 @@ def main():
                 print_decisions(decisions, compact=False)
             
             # Next check countdown
-            print(f"\n⏳ Next check in {CHECK_INTERVAL_SECONDS} seconds...")
+            print(f"\nNext check in {CHECK_INTERVAL_SECONDS} seconds...")
             
             # Sleep
             time.sleep(CHECK_INTERVAL_SECONDS)
@@ -344,7 +507,7 @@ def main():
             print(f"\nError in iteration: {e}")
             import traceback
             traceback.print_exc()
-            print(f"\n⏳ Retrying in {CHECK_INTERVAL_SECONDS} seconds...")
+            print(f"\nRetrying in {CHECK_INTERVAL_SECONDS} seconds...")
             time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
