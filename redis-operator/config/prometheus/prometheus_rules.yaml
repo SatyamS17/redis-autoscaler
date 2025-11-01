@@ -1,0 +1,68 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: redis-per-pod-metrics
+  namespace: monitoring # Make sure this is your Prometheus namespace
+  labels:
+    release: prometheus # This label ensures Prometheus finds this rule
+spec:
+  groups:
+  # Per-pod resource usage
+  - name: redis-per-pod-resources
+    interval: 15s
+    rules:
+    - record: redis:cpu_percent:by_pod
+      expr: |
+        sum(rate(container_cpu_usage_seconds_total{pod=~"redis-cluster-.*",container="redis"}[1m])) by (pod) * 100
+      labels:
+        metric_type: "cpu"
+
+    - record: redis:memory_used_mb:by_pod
+      expr: |
+        sum(container_memory_working_set_bytes{pod=~"redis-cluster-.*",container="redis"}) by (pod) / 1024 / 1024
+      labels:
+        metric_type: "memory"
+
+  # Per-pod Redis-specific metrics (read/write operations)
+  - name: redis-per-pod-operations
+    interval: 15s
+    rules:
+    # Total commands processed per second per pod
+    - record: redis:commands_per_sec:by_pod
+      expr: |
+        rate(redis_commands_processed_total{pod=~"redis-cluster-.*"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Total reads (GET commands)
+    - record: redis:read_ops_per_sec:by_pod
+      expr: |
+        rate(redis_commands_processed_total{pod=~"redis-cluster-.*", cmd="get"}[1m])
+      labels:
+        metric_type: "operations"
+
+    # Total writes (SET commands)
+    - record: redis:write_ops_per_sec:by_pod
+      expr: |
+        rate(redis_commands_processed_total{pod=~"redis-cluster-.*", cmd="set"}[1m])
+      labels:
+        metric_type: "operations"
+
+  # Cluster-wide aggregates
+  - name: redis-cluster-aggregates
+    interval: 15s
+    rules:
+    - record: redis:avg_cpu_percent:cluster
+      expr: avg(redis:cpu_percent:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+
+    - record: redis:total_read_ops_per_sec:cluster
+      expr: sum(redis:read_ops_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"
+        
+    - record: redis:total_write_ops_per_sec:cluster
+      expr: sum(redis:write_ops_per_sec:by_pod)
+      labels:
+        metric_type: "cluster_aggregate"

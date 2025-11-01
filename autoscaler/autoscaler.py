@@ -15,7 +15,7 @@ class RedisAutoscaler:
     def __init__(self):
         self.namespace = "default"
         self.redis_cluster_name = "redis-redis-cluster"
-        self.redis_password = os.getenv('REDIS_PASSWORD', 'HIYCPE8NtO')
+        self.redis_password = os.getenv('REDIS_PASSWORD', 'dLmneBMyxb')
         self.upscale_threshold = float(os.getenv('UPSCALE_CPU_THRESHOLD', '10.0'))
         self.downscale_threshold = float(os.getenv('DOWNSCALE_CPU_THRESHOLD', '5.0'))
         self.cooldown_minutes = int(os.getenv('COOLDOWN_MINUTES', '1'))

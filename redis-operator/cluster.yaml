@@ -1,0 +1,10 @@
+apiVersion: cache.example.com/v1
+kind: RedisCluster
+metadata:
+  name: redis-cluster
+  namespace: default
+spec:
+  size: 3
+  redisVersion: "latest"
+  autoScaleEnabled: true
+  cpuThreshold: 12
