@@ -41,6 +41,8 @@ type RedisClusterStatus struct {
 	AvgCPUUsage     int32 `json:"avgCpuUsage"`
 	// +optional
 	Initialized bool `json:"initialized,omitempty"`
+	// +optional
+	IsResharding bool `json:"isResharding,omitempty"`
 }
 
 // +kubebuilder:object:root=true

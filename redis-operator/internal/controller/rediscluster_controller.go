@@ -160,8 +160,22 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("bootstrap job %s failed", jobName)
 	}
 
-	logger.Info("Bootstrap job is still running...")
-	return ctrl.Result{Requeue: true}, nil
+	if !cluster.Status.Initialized {
+		logger.Info("Bootstrap job is still running...")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// --- AUTOSCALER ENTRY POINT ---
+	// 10. If cluster IS initialized AND autoscaling is enabled, run the autoscaler
+	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
+		logger.Info("Cluster is initialized, checking autoscaler")
+		// This function is in autoscaler.go
+		return r.handleAutoScaling(ctx, cluster)
+	}
+
+	logger.Info("Successfully reconciled. Autoscaling disabled.")
+	// If not scaling, just requeue after a minute to check again.
+	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
 // reconcileService handles creation and updates for the Service
