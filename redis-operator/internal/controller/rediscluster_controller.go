@@ -19,8 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -31,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	appv1 "github.com/myuser/redis-operator/api/v1"
+	appv1 "github.com/myuser/redis-operator/api/v1" // Make sure this import path matches your project
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
@@ -46,6 +49,8 @@ type RedisClusterReconciler struct {
 // +kubebuilder:rbac:groups=cache.example.com,resources=redisclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -63,42 +68,104 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile the Headless Service (for the StatefulSet)
+	// 2. Reconcile the ConfigMap for redis.conf
+	cm := r.configMapForRedisCluster(cluster)
+	if err := r.reconcileConfigMap(ctx, cluster, cm); err != nil {
+		logger.Error(err, "Failed to reconcile ConfigMap")
+		return ctrl.Result{}, err
+	}
+
+	// 3. Reconcile the Headless Service
 	svc := r.serviceForRedisCluster(cluster)
 	if err := r.reconcileService(ctx, cluster, svc); err != nil {
 		logger.Error(err, "Failed to reconcile Service")
 		return ctrl.Result{}, err
 	}
 
-	// 3. Reconcile the StatefulSet (with redis + exporter sidecar)
+	// 4. Reconcile the StatefulSet
 	sts := r.statefulSetForRedisCluster(cluster)
 	if err := r.reconcileStatefulSet(ctx, cluster, sts); err != nil {
 		logger.Error(err, "Failed to reconcile StatefulSet")
 		return ctrl.Result{}, err
 	}
 
-	// 4. Reconcile the ServiceMonitor (for Prometheus)
+	// 5. Reconcile the ServiceMonitor
 	sm := r.serviceMonitorForRedisCluster(cluster, svc)
 	if err := r.reconcileServiceMonitor(ctx, cluster, sm); err != nil {
 		logger.Error(err, "Failed to reconcile ServiceMonitor")
 		return ctrl.Result{}, err
 	}
 
-	// --- Your autoscaling logic would go here ---
-	// You can now re-add your old logic. It will query Prometheus
-	// for the metrics being exported by the sidecar we just created.
-	// For example:
-	// if cluster.Spec.AutoScaleEnabled {
-	//     ... your autoscaling logic ...
-	// }
+	// --- Cluster Bootstrap Logic ---
 
-	logger.Info("Successfully reconciled all resources")
-	return ctrl.Result{Requeue: true}, nil // Requeue to check status
+	// 6. Check if StatefulSet pods are all ready
+	foundSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), foundSts); err != nil {
+		logger.Error(err, "Failed to get StatefulSet for status check")
+		return ctrl.Result{}, err
+	}
+
+	totalReplicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	if foundSts.Status.ReadyReplicas != totalReplicas {
+		logger.Info("Waiting for all StatefulSet replicas to be ready", "Ready", foundSts.Status.ReadyReplicas, "Desired", totalReplicas)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // Requeue until all pods are ready
+	}
+
+	// 7. If all pods are ready, check if cluster is already initialized
+	if cluster.Status.Initialized {
+		logger.Info("Redis cluster already initialized. Skipping bootstrap.")
+		// Your autoscaling logic would go here
+		return ctrl.Result{}, nil
+	}
+
+	// 8. Cluster is not initialized, check for/run the bootstrap Job
+	bootstrapJob := &batchv1.Job{}
+	jobName := cluster.Name + "-bootstrap"
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, bootstrapJob)
+
+	if err != nil && errors.IsNotFound(err) {
+		// Job not found, create it
+		logger.Info("Creating cluster bootstrap Job")
+		job := r.bootstrapJobForRedisCluster(cluster)
+		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+			logger.Error(err, "Failed to set owner reference on bootstrap Job")
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			logger.Error(err, "Failed to create bootstrap Job")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil // Requeue to check Job status
+
+	} else if err != nil {
+		logger.Error(err, "Failed to get bootstrap Job")
+		return ctrl.Result{}, err
+	}
+
+	// 9. Job already exists, check its status
+	if bootstrapJob.Status.Succeeded > 0 {
+		// Job succeeded! Update our CRD status
+		logger.Info("Bootstrap Job succeeded. Updating cluster status.")
+		cluster.Status.Initialized = true
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update RedisCluster status")
+			return ctrl.Result{}, err
+		}
+		logger.Info("Successfully reconciled and bootstrapped cluster")
+		return ctrl.Result{}, nil
+	}
+
+	if bootstrapJob.Status.Failed > 0 {
+		logger.Error(fmt.Errorf("bootstrap job %s failed", jobName), "Cluster initialization failed")
+		return ctrl.Result{}, fmt.Errorf("bootstrap job %s failed", jobName)
+	}
+
+	logger.Info("Bootstrap job is still running...")
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // reconcileService handles creation and updates for the Service
 func (r *RedisClusterReconciler) reconcileService(ctx context.Context, cluster *appv1.RedisCluster, desired *corev1.Service) error {
-	// Set RedisCluster instance as the owner and controller
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
 	}
@@ -107,7 +174,6 @@ func (r *RedisClusterReconciler) reconcileService(ctx context.Context, cluster *
 
 // reconcileStatefulSet handles creation and updates for the StatefulSet
 func (r *RedisClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *appv1.RedisCluster, desired *appsv1.StatefulSet) error {
-	// Set RedisCluster instance as the owner and controller
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
 	}
@@ -116,7 +182,14 @@ func (r *RedisClusterReconciler) reconcileStatefulSet(ctx context.Context, clust
 
 // reconcileServiceMonitor handles creation and updates for the ServiceMonitor
 func (r *RedisClusterReconciler) reconcileServiceMonitor(ctx context.Context, cluster *appv1.RedisCluster, desired *monitoringv1.ServiceMonitor) error {
-	// Set RedisCluster instance as the owner and controller
+	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
+		return err
+	}
+	return r.reconcileResource(ctx, desired)
+}
+
+// reconcileConfigMap handles creation and updates for the ConfigMap
+func (r *RedisClusterReconciler) reconcileConfigMap(ctx context.Context, cluster *appv1.RedisCluster, desired *corev1.ConfigMap) error {
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
 	}
@@ -130,25 +203,43 @@ func (r *RedisClusterReconciler) reconcileResource(ctx context.Context, obj clie
 
 	if err := r.Get(ctx, key, current); err != nil {
 		if errors.IsNotFound(err) {
-			// Create the resource
 			log.FromContext(ctx).Info("Creating new resource", "Kind", obj.GetObjectKind().GroupVersionKind().Kind, "Name", key.Name)
 			return r.Create(ctx, obj)
 		}
-		return err // Other error
+		return err
 	}
 
-	// Update the resource
-	// This is a simple update, for production you might need a strategic merge
 	log.FromContext(ctx).Info("Updating existing resource", "Kind", obj.GetObjectKind().GroupVersionKind().Kind, "Name", key.Name)
-	// We need to copy the resource version from the current object to the desired object for the update to work
 	obj.SetResourceVersion(current.GetResourceVersion())
 	return r.Update(ctx, obj)
+}
+
+// configMapForRedisCluster defines the desired ConfigMap for redis.conf
+func (r *RedisClusterReconciler) configMapForRedisCluster(cluster *appv1.RedisCluster) *corev1.ConfigMap {
+	labels := getLabels(cluster)
+	config := `
+port 6379
+cluster-enabled yes
+cluster-config-file /data/nodes.conf
+cluster-node-timeout 5000
+appendonly yes
+bind 0.0.0.0
+`
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster.Name + "-config",
+			Namespace: cluster.Namespace,
+			Labels:    labels,
+		},
+		Data: map[string]string{
+			"redis.conf": config,
+		},
+	}
 }
 
 // serviceForRedisCluster defines the desired Headless Service
 func (r *RedisClusterReconciler) serviceForRedisCluster(cluster *appv1.RedisCluster) *corev1.Service {
 	labels := getLabels(cluster)
-
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name + "-headless",
@@ -156,17 +247,11 @@ func (r *RedisClusterReconciler) serviceForRedisCluster(cluster *appv1.RedisClus
 			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
-			ClusterIP: "None", // Headless service
+			ClusterIP: "None",
 			Selector:  labels,
 			Ports: []corev1.ServicePort{
-				{
-					Name: "redis",
-					Port: 6379,
-				},
-				{
-					Name: "metrics",
-					Port: 9121,
-				},
+				{Name: "redis", Port: 6379},
+				{Name: "metrics", Port: 9121},
 			},
 		},
 	}
@@ -175,7 +260,7 @@ func (r *RedisClusterReconciler) serviceForRedisCluster(cluster *appv1.RedisClus
 // statefulSetForRedisCluster defines the desired StatefulSet
 func (r *RedisClusterReconciler) statefulSetForRedisCluster(cluster *appv1.RedisCluster) *appsv1.StatefulSet {
 	labels := getLabels(cluster)
-	replicas := cluster.Spec.Size
+	replicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
 
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -199,26 +284,35 @@ func (r *RedisClusterReconciler) statefulSetForRedisCluster(cluster *appv1.Redis
 					},
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						// --- Main Redis Container ---
+					Volumes: []corev1.Volume{
 						{
-							Name:  "redis",
-							Image: fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion), // Use version from CR
+							Name: "config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: cluster.Name + "-config",
+									},
+								},
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:    "redis",
+							Image:   fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion),
+							Command: []string{"redis-server", "/conf/redis.conf"},
 							Ports: []corev1.ContainerPort{
 								{ContainerPort: 6379, Name: "redis"},
 							},
-							// TODO: Add readiness/liveness probes and volume mounts
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "config", MountPath: "/conf"},
+								{Name: "data", MountPath: "/data"},
+							},
 						},
-						// --- Redis Exporter Sidecar ---
 						{
 							Name:  "redis-exporter",
 							Image: "bitnamilegacy/redis-exporter:1.59.0",
-							Args: []string{
-								"--redis.addr=redis://localhost:6379",
-								// TODO: Add password support if needed
-								// "--redis.password=$(REDIS_PASSWORD)"
-							},
-							// TODO: Add EnvFrom secret if password is used
+							Args:  []string{"--redis.addr=redis://localhost:6379"},
 							Ports: []corev1.ContainerPort{
 								{ContainerPort: 9121, Name: "metrics"},
 							},
@@ -236,7 +330,58 @@ func (r *RedisClusterReconciler) statefulSetForRedisCluster(cluster *appv1.Redis
 					},
 				},
 			},
-			// TODO: Add VolumeClaimTemplates for persistent storage
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "data"},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{"ReadWriteOnce"},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// bootstrapJobForRedisCluster defines the desired Job to initialize the cluster
+func (r *RedisClusterReconciler) bootstrapJobForRedisCluster(cluster *appv1.RedisCluster) *batchv1.Job {
+	serviceName := cluster.Name + "-headless"
+	namespace := cluster.Namespace
+	totalReplicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	replicasFlag := cluster.Spec.ReplicasPerMaster
+
+	var hosts []string
+	for i := int32(0); i < totalReplicas; i++ {
+		hosts = append(hosts, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:6379", cluster.Name, i, serviceName, namespace))
+	}
+	hostString := strings.Join(hosts, " ")
+	cliCmd := fmt.Sprintf("redis-cli --cluster create %s --cluster-replicas %d --cluster-yes", hostString, replicasFlag)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster.Name + "-bootstrap",
+			Namespace: cluster.Namespace,
+			Labels:    getLabels(cluster),
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:    "bootstrap",
+							Image:   fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion),
+							Command: []string{"sh", "-c"},
+							Args:    []string{cliCmd},
+						},
+					},
+				},
+			},
+			BackoffLimit: new(int32),
 		},
 	}
 }
@@ -247,17 +392,15 @@ func (r *RedisClusterReconciler) serviceMonitorForRedisCluster(cluster *appv1.Re
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name,
 			Namespace: cluster.Namespace,
-			Labels: map[string]string{
-				"release": "prometheus", // This label tells the Prometheus Operator to find it
-			},
+			Labels:    map[string]string{"release": "prometheus"},
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
-				MatchLabels: svc.Labels, // Selects the Service we created
+				MatchLabels: svc.Labels,
 			},
 			Endpoints: []monitoringv1.Endpoint{
 				{
-					Port:     "metrics", // Tells Prometheus to scrape the "metrics" port (9121)
+					Port:     "metrics",
 					Interval: "15s",
 				},
 			},
@@ -278,9 +421,11 @@ func getLabels(cluster *appv1.RedisCluster) map[string]string {
 func (r *RedisClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appv1.RedisCluster{}).
-		Owns(&appsv1.StatefulSet{}).          // Watch StatefulSets
-		Owns(&corev1.Service{}).              // Watch Services
-		Owns(&monitoringv1.ServiceMonitor{}). // Watch ServiceMonitors
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&batchv1.Job{}).
+		Owns(&monitoringv1.ServiceMonitor{}).
 		Named("rediscluster").
 		Complete(r)
 }

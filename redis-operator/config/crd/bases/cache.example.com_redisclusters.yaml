@@ -44,15 +44,21 @@ spec:
               cpuThreshold:
                 format: int32
                 type: integer
+              masters:
+                format: int32
+                minimum: 1
+                type: integer
               redisVersion:
                 type: string
-              size:
+              replicasPerMaster:
                 format: int32
+                minimum: 0
                 type: integer
             required:
             - autoScaleEnabled
             - cpuThreshold
-            - size
+            - masters
+            - replicasPerMaster
             type: object
           status:
             description: RedisClusterStatus defines the observed state of RedisCluster.
@@ -66,6 +72,8 @@ spec:
               currentReplicas:
                 format: int32
                 type: integer
+              initialized:
+                type: boolean
             required:
             - avgCpuUsage
             - currentMasters

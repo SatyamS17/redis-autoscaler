@@ -25,10 +25,13 @@ import (
 
 // RedisClusterSpec defines the desired state of RedisCluster.
 type RedisClusterSpec struct {
-	Size             int32  `json:"size"` // number of master nodes
-	AutoScaleEnabled bool   `json:"autoScaleEnabled"`
-	CpuThreshold     int32  `json:"cpuThreshold"` // e.g., 70 means 70%
-	RedisVersion     string `json:"redisVersion,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	Masters int32 `json:"masters"`
+	// +kubebuilder:validation:Minimum=0
+	ReplicasPerMaster int32  `json:"replicasPerMaster"`
+	AutoScaleEnabled  bool   `json:"autoScaleEnabled"`
+	CpuThreshold      int32  `json:"cpuThreshold"`
+	RedisVersion      string `json:"redisVersion,omitempty"`
 }
 
 // RedisClusterStatus defines the observed state of RedisCluster.
@@ -36,6 +39,8 @@ type RedisClusterStatus struct {
 	CurrentMasters  int32 `json:"currentMasters"`
 	CurrentReplicas int32 `json:"currentReplicas"`
 	AvgCPUUsage     int32 `json:"avgCpuUsage"`
+	// +optional
+	Initialized bool `json:"initialized,omitempty"`
 }
 
 // +kubebuilder:object:root=true

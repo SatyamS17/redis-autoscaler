@@ -4,7 +4,8 @@ metadata:
   name: redis-cluster
   namespace: default
 spec:
-  size: 3
-  redisVersion: "latest"
+  masters: 3
+  replicasPerMaster: 1
+  redisVersion: "7.2"
   autoScaleEnabled: true
   cpuThreshold: 12
