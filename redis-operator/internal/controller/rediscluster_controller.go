@@ -112,70 +112,104 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 7. If all pods are ready, check if cluster is already initialized
-	if cluster.Status.Initialized {
-		logger.Info("Redis cluster already initialized. Skipping bootstrap.")
-		// Your autoscaling logic would go here
-		return ctrl.Result{}, nil
-	}
-
-	// 8. Cluster is not initialized, check for/run the bootstrap Job
-	bootstrapJob := &batchv1.Job{}
-	jobName := cluster.Name + "-bootstrap"
-	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, bootstrapJob)
-
-	if err != nil && errors.IsNotFound(err) {
-		// Job not found, create it
-		logger.Info("Creating cluster bootstrap Job")
-		job := r.bootstrapJobForRedisCluster(cluster)
-		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
-			logger.Error(err, "Failed to set owner reference on bootstrap Job")
-			return ctrl.Result{}, err
-		}
-		if err := r.Create(ctx, job); err != nil {
-			logger.Error(err, "Failed to create bootstrap Job")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil // Requeue to check Job status
-
-	} else if err != nil {
-		logger.Error(err, "Failed to get bootstrap Job")
-		return ctrl.Result{}, err
-	}
-
-	// 9. Job already exists, check its status
-	if bootstrapJob.Status.Succeeded > 0 {
-		// Job succeeded! Update our CRD status
-		logger.Info("Bootstrap Job succeeded. Updating cluster status.")
-		cluster.Status.Initialized = true
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			logger.Error(err, "Failed to update RedisCluster status")
-			return ctrl.Result{}, err
-		}
-		logger.Info("Successfully reconciled and bootstrapped cluster")
-		return ctrl.Result{}, nil
-	}
-
-	if bootstrapJob.Status.Failed > 0 {
-		logger.Error(fmt.Errorf("bootstrap job %s failed", jobName), "Cluster initialization failed")
-		return ctrl.Result{}, fmt.Errorf("bootstrap job %s failed", jobName)
-	}
-
 	if !cluster.Status.Initialized {
-		logger.Info("Bootstrap job is still running...")
-		return ctrl.Result{Requeue: true}, nil
+		// 8. Cluster is not initialized, check for/run the bootstrap Job
+		bootstrapJob := &batchv1.Job{}
+		jobName := cluster.Name + "-bootstrap"
+		err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, bootstrapJob)
+
+		if err != nil && errors.IsNotFound(err) {
+			// Job not found, create it
+			logger.Info("Creating cluster bootstrap Job")
+			job := r.bootstrapJobForRedisCluster(cluster)
+			if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+				logger.Error(err, "Failed to set owner reference on bootstrap Job")
+				return ctrl.Result{}, err
+			}
+			if err := r.Create(ctx, job); err != nil {
+				logger.Error(err, "Failed to create bootstrap Job")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil // Requeue to check Job status
+
+		} else if err != nil {
+			logger.Error(err, "Failed to get bootstrap Job")
+			return ctrl.Result{}, err
+		}
+
+		// 9. Job already exists, check its status
+		if bootstrapJob.Status.Succeeded > 0 {
+			// Job succeeded! Update our CRD status
+			logger.Info("Bootstrap Job succeeded. Updating cluster status.")
+			cluster.Status.Initialized = true
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				logger.Error(err, "Failed to update RedisCluster status")
+				return ctrl.Result{}, err
+			}
+			logger.Info("Successfully reconciled and bootstrapped cluster")
+			return ctrl.Result{}, nil
+		}
+
+		if bootstrapJob.Status.Failed > 0 {
+			logger.Error(fmt.Errorf("bootstrap job %s failed", jobName), "Cluster initialization failed")
+			return ctrl.Result{}, fmt.Errorf("bootstrap job %s failed", jobName)
+		}
+
+		if !cluster.Status.Initialized {
+			logger.Info("Bootstrap job is still running...")
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// --- AUTOSCALER ENTRY POINT ---
 	// 10. If cluster IS initialized AND autoscaling is enabled, run the autoscaler
 	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
 		logger.Info("Cluster is initialized, checking autoscaler")
+
+		// Check if we're in cooldown period (1 minute)
+		if cluster.Status.LastScaleTime != nil {
+			cooldownPeriod := time.Minute
+			timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
+			if timeSinceLastScale < cooldownPeriod {
+				logger.Info("In cooldown period, skipping autoscaling",
+					"timeSinceLastScale", timeSinceLastScale.String(),
+					"cooldownPeriod", cooldownPeriod.String())
+				return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
+			}
+		}
+
 		// This function is in autoscaler.go
-		return r.handleAutoScaling(ctx, cluster)
+		result, err := r.handleAutoScaling(ctx, cluster)
+		if err != nil {
+			logger.Error(err, "Failed to handle autoscaling")
+			return ctrl.Result{}, err
+		}
+
+		// Update LastScaleTime if scaling operation was performed
+		if result.RequeueAfter == 1*time.Second {
+			logger.Info("Scale-up detected, setting cooldown timer.")
+			now := metav1.Now()
+			cluster.Status.LastScaleTime = &now
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				logger.Error(err, "Failed to update LastScaleTime")
+				// Don't block the requeue, just log the error
+			}
+			// Pass along the 1-second requeue to trigger the cooldown check
+			return result, nil
+		}
+
+		// If it was any other requeue (like from checkReshardingStatus),
+		// just return the result without resetting the cooldown.
+		if result.RequeueAfter > 0 {
+			return result, nil
+		}
+
+		return result, nil
 	}
 
 	logger.Info("Successfully reconciled. Autoscaling disabled.")
-	// If not scaling, just requeue after a minute to check again.
-	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	// If not scaling, just requeue after 15 seconds to check again.
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
 // reconcileService handles creation and updates for the Service

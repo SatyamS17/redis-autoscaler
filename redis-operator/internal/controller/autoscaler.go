@@ -34,7 +34,8 @@ func (r *RedisClusterReconciler) handleAutoScaling(ctx context.Context, cluster 
 	// --- STATE 1: Resharding ---
 	// We are currently in the middle of a scaling operation.
 	if cluster.Status.IsResharding {
-		logger.Info("Cluster is currently resharding. Checking status.")
+		// UPDATED LOG MESSAGE:
+		logger.Info("Cluster is locked for resharding. Checking job status, NOT monitoring CPU.")
 		return r.checkReshardingStatus(ctx, cluster)
 	}
 
@@ -61,14 +62,16 @@ func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, clus
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// 2. Pods are ready. Now check the resharding Job.
+	logger.Info("All StatefulSet pods are ready. Checking for reshard job.")
+
+	// 2. All pods are ready. Check for the resharding Job.
 	reshardJob := &batchv1.Job{}
 	jobName := cluster.Name + "-reshard"
 	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, reshardJob)
 
 	if err != nil && errors.IsNotFound(err) {
 		// Job not found, create it
-		logger.Info("New pods are ready. Creating reshard Job.")
+		logger.Info("Creating smart reshard Job.")
 		job := r.reshardJobForRedisCluster(cluster)
 		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
 			logger.Error(err, "Failed to set owner ref on reshard Job")
@@ -107,14 +110,14 @@ func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, clus
 			logger.Error(err, "Failed to update status after failed reshard")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil // Wait before retrying
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil // Wait before retrying
 	}
 
 	logger.Info("Reshard job is still running...")
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// monitorCPUUsage queries Prometheus and triggers scaling if needed.
+// monitorCPUUsage queries Prometheus for individual pod CPU and triggers scaling if needed.
 func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -127,10 +130,10 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	v1api := prometheusv1.NewAPI(client)
 
 	// 2. Build and run the query.
-	// This query gets the average CPU usage *percentage* across all "redis" containers
-	// in our StatefulSet over the last 2 minutes.
+	// This query gets the CPU usage *percentage* for each individual "redis" container
+	// in our StatefulSet over the last minute.
 	query := fmt.Sprintf(
-		`avg(rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s"}[2m])) * 100`,
+		`rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s"}[1m]) * 100`,
 		cluster.Name,
 		cluster.Namespace,
 	)
@@ -138,7 +141,7 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	result, warnings, err := v1api.Query(ctx, query, time.Now())
 	if err != nil {
 		logger.Error(err, "Error querying Prometheus", "query", query)
-		return ctrl.Result{RequeueAfter: 1 * time.Minute}, err
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
 	}
 	if len(warnings) > 0 {
 		logger.Info("Prometheus warnings", "warnings", warnings)
@@ -148,17 +151,27 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	vec, ok := result.(model.Vector)
 	if !ok || vec.Len() == 0 {
 		logger.Info("Prometheus query returned no data. Skipping check.")
-		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	avgCPU := float64(vec[0].Value)
 	threshold := float64(cluster.Spec.CpuThreshold)
-	logger.Info("Current cluster CPU usage", "avgCPU", avgCPU, "threshold", threshold)
+	var scaleUp bool = false
 
-	// 4. Take action if threshold is breached
-	if avgCPU > threshold {
-		logger.Info("CPU threshold breached! Scaling up cluster.", "AvgCPU", avgCPU)
+	// 4. Iterate over each pod's CPU usage and check against the threshold.
+	for _, sample := range vec {
+		podName := string(sample.Metric["pod"])
+		cpuUsage := float64(sample.Value)
+		logger.Info("Checking pod CPU usage", "pod", podName, "cpuUsage", cpuUsage, "threshold", threshold)
 
+		if cpuUsage > threshold {
+			logger.Info("CPU threshold breached by a pod! Scaling up cluster.", "pod", podName, "cpuUsage", cpuUsage)
+			scaleUp = true
+			break // Found a pod that needs scaling, no need to check others.
+		}
+	}
+
+	// 5. Take action if any pod breached the threshold
+	if scaleUp {
 		// Set the lock
 		cluster.Status.IsResharding = true
 		if err := r.Status().Update(ctx, cluster); err != nil {
@@ -166,7 +179,7 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 			return ctrl.Result{}, err
 		}
 
-		// Increase the master count
+		// Increase the master count by exactly one
 		cluster.Spec.Masters++
 		if err := r.Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update spec to increase masters")
@@ -179,29 +192,169 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		// Success! The Reconcile loop will be triggered by the Spec update.
 		// The main controller will update the StatefulSet.
 		// The next loop will see IsResharding=true and go to checkReshardingStatus.
-		return ctrl.Result{}, nil
+		logger.Info("Successfully triggered scale-up by increasing master count", "newMasterCount", cluster.Spec.Masters)
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
 	// All good, check again later.
-	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	logger.Info("All pods are within CPU threshold.")
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
 // reshardJobForRedisCluster defines the Job to rebalance the cluster.
 func (r *RedisClusterReconciler) reshardJobForRedisCluster(cluster *appv1.RedisCluster) *batchv1.Job {
-	// We just need one pod to act as the entrypoint for the rebalance command.
-	anyPod := fmt.Sprintf("%s-0.%s.%s.svc.cluster.local:6379", cluster.Name, cluster.Name+"-headless", cluster.Namespace)
+	anyPodHost := fmt.Sprintf("%s-0.%s.%s.svc.cluster.local", cluster.Name, cluster.Name+"-headless", cluster.Namespace)
+	anyPodPort := "6379"
+	anyPodEntrypoint := fmt.Sprintf("%s:%s", anyPodHost, anyPodPort)
 
-	// This command tells redis-cli to rebalance the cluster and assign
-	// slots to any new, empty master nodes.
-	cliCmd := fmt.Sprintf("redis-cli --cluster rebalance %s --cluster-use-empty-masters --cluster-yes", anyPod)
+	serviceName := cluster.Name + "-headless"
+	expectedNodes := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	timeout := 300
+	if cluster.Spec.ReshardTimeoutSeconds > 0 {
+		timeout = int(cluster.Spec.ReshardTimeoutSeconds)
+	}
+
+	cliCmd := fmt.Sprintf(`
+set -x
+
+echo "--- Smart Reshard Job Started ---"
+wait_until=$(($(date +%%s) + %d))
+rebalance_timeout=$((%d - 30))
+[ $rebalance_timeout -lt 60 ] && rebalance_timeout=60
+
+EXPECTED_NODES=%d
+ANY_POD_HOST="%s"
+ANY_POD_PORT="%s"
+ANY_POD_ENTRYPOINT="%s"
+CLUSTER_NAME="%s"
+SERVICE_NAME="%s"
+NAMESPACE="%s"
+
+echo "Running 'redis-cli --cluster fix' to clean up any stuck slots..."
+yes | redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT --cluster fix $ANY_POD_ENTRYPOINT
+echo "Cluster fix complete."
+
+echo "Checking for orphaned nodes..."
+cluster_nodes_output=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes)
+actual_nodes_count=$(echo "$cluster_nodes_output" | grep -v fail | wc -l)
+known_node_ips=$(echo "$cluster_nodes_output" | grep -v fail | awk '{ print $2 }' | cut -d'@' -f1 | cut -d':' -f1)
+echo "$known_node_ips"
+
+if [ "$actual_nodes_count" -lt "$EXPECTED_NODES" ]; then
+  echo "Finding orphan nodes to add..."
+  orphan_nodes_dns=""
+  for i in $(seq 0 $(($EXPECTED_NODES - 1))); do
+    pod_dns="${CLUSTER_NAME}-${i}.${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+    pod_ip=$(getent hosts $pod_dns | awk '{ print $1 }' || true)
+    if [ -z "$pod_ip" ]; then
+      echo "Skipping unresolved DNS: $pod_dns"
+      continue
+    fi
+    if ! echo "$known_node_ips" | grep -q "$pod_ip"; then
+      echo "Found orphan: $pod_dns (IP: $pod_ip)"
+      orphan_nodes_dns="$orphan_nodes_dns $pod_dns"
+    fi
+  done
+
+  master_dns=""
+  for orphan in $orphan_nodes_dns; do
+    if [ -z "$master_dns" ]; then
+      master_dns=$orphan
+    else
+      replica_dns=$orphan
+      echo "Adding MASTER=$master_dns, REPLICA=$replica_dns"
+      redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT --cluster add-node ${master_dns}:6379 $ANY_POD_ENTRYPOINT || true
+      sleep 5
+      new_master_ip=$(getent hosts $master_dns | awk '{ print $1 }')
+      new_master_id=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | grep $new_master_ip | grep master | awk '{ print $1 }')
+      redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT --cluster add-node ${replica_dns}:6379 $ANY_POD_ENTRYPOINT --cluster-slave --cluster-master-id $new_master_id || true
+      master_dns=""
+    fi
+  done
+fi
+
+echo "Waiting for all $EXPECTED_NODES nodes to join..."
+while true; do
+  joined=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | grep -v fail | wc -l)
+  [ "$joined" -eq "$EXPECTED_NODES" ] && break
+  [ $(date +%%s) -gt $wait_until ] && echo "Timeout waiting for nodes." && exit 1
+  echo "Waiting... $joined/$EXPECTED_NODES nodes joined."
+  sleep 5
+done
+
+echo "Waiting for an empty master..."
+while true; do
+  empty_masters=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | grep master | grep -v fail | awk '$9==""' | wc -l)
+  [ "$empty_masters" -gt 0 ] && echo "Found $empty_masters empty master(s)." && break
+  [ $(date +%%s) -gt $wait_until ] && echo "Timeout: no empty masters found." && exit 1
+  echo "Waiting... still none."
+  sleep 5
+done
+
+# --- Disable full coverage on all nodes ---
+echo "Disabling full coverage check on all nodes..."
+node_ips=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | awk '{ print $2 }' | cut -d'@' -f1 | cut -d':' -f1 | sort -u)
+for ip in $node_ips; do
+  if redis-cli -h $ip -p 6379 ping >/dev/null 2>&1; then
+    redis-cli -h $ip -p 6379 config set cluster-require-full-coverage no || echo "WARN: Failed config set on $ip"
+  else
+    echo "WARN: Node $ip not reachable for config set"
+  fi
+done
+sleep 3
+
+# --- Run rebalance with retry ---
+echo "Starting rebalance attempt #1..."
+if timeout $rebalance_timeout redis-cli --cluster rebalance $ANY_POD_ENTRYPOINT --cluster-use-empty-masters --cluster-yes; then
+  echo "Rebalance succeeded on attempt #1"
+else
+  echo "Rebalance failed, running 'redis-cli --cluster fix' and retrying..."
+  yes | redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT --cluster fix $ANY_POD_ENTRYPOINT
+  sleep 5
+  echo "Starting rebalance attempt #2..."
+  if timeout $rebalance_timeout redis-cli --cluster rebalance $ANY_POD_ENTRYPOINT --cluster-use-empty-masters --cluster-yes; then
+    echo "Rebalance succeeded on attempt #2"
+  else
+    echo "ERROR: Rebalance failed twice. Dumping state..."
+    redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes
+    redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster info
+    exit 1
+  fi
+fi
+
+# --- Re-enable full coverage on all nodes ---
+echo "Re-enabling full coverage on all nodes..."
+for ip in $node_ips; do
+  if redis-cli -h $ip -p 6379 ping >/dev/null 2>&1; then
+    redis-cli -h $ip -p 6379 config set cluster-require-full-coverage yes || echo "WARN: Failed re-enable on $ip"
+  fi
+done
+sleep 3
+
+echo "--- Smart Reshard Job Finished ---"
+	`,
+		timeout,
+		timeout,
+		expectedNodes,
+		anyPodHost,
+		anyPodPort,
+		anyPodEntrypoint,
+		cluster.Name,
+		serviceName,
+		cluster.Namespace,
+	)
+
+	ads := int64(timeout + 120)
+	backoff := int32(0)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name + "-reshard",
 			Namespace: cluster.Namespace,
-			Labels:    getLabels(cluster), // getLabels() is from your other controller file
+			Labels:    getLabels(cluster),
 		},
 		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds: &ads,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyOnFailure,
@@ -215,7 +368,7 @@ func (r *RedisClusterReconciler) reshardJobForRedisCluster(cluster *appv1.RedisC
 					},
 				},
 			},
-			BackoffLimit: new(int32), // 0 retries, we handle failure in the controller
+			BackoffLimit: &backoff,
 		},
 	}
 }

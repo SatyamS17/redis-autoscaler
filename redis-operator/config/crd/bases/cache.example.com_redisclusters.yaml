@@ -54,6 +54,12 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              reshardTimeoutSeconds:
+                default: 300
+                format: int32
+                maximum: 3600
+                minimum: 60
+                type: integer
             required:
             - autoScaleEnabled
             - cpuThreshold
@@ -74,6 +80,11 @@ spec:
                 type: integer
               initialized:
                 type: boolean
+              isResharding:
+                type: boolean
+              lastScaleTime:
+                format: date-time
+                type: string
             required:
             - avgCpuUsage
             - currentMasters

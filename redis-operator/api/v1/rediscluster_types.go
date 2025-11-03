@@ -32,6 +32,10 @@ type RedisClusterSpec struct {
 	AutoScaleEnabled  bool   `json:"autoScaleEnabled"`
 	CpuThreshold      int32  `json:"cpuThreshold"`
 	RedisVersion      string `json:"redisVersion,omitempty"`
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=3600
+	// +kubebuilder:default=300
+	ReshardTimeoutSeconds int32 `json:"reshardTimeoutSeconds,omitempty"`
 }
 
 // RedisClusterStatus defines the observed state of RedisCluster.
@@ -43,6 +47,8 @@ type RedisClusterStatus struct {
 	Initialized bool `json:"initialized,omitempty"`
 	// +optional
 	IsResharding bool `json:"isResharding,omitempty"`
+	// +optional
+	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

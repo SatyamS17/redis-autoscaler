@@ -8,4 +8,7 @@ spec:
   replicasPerMaster: 1
   redisVersion: "7.2"
   autoScaleEnabled: true
-  cpuThreshold: 12
+  cpuThreshold: 50
+  reshardTimeoutSeconds: 600
+
+  
