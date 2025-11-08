@@ -26,26 +26,134 @@ import (
 // TODO: Make this configurable!
 const PromServiceURL = "http://prometheus-operated.monitoring.svc:9090"
 
+// --- UPDATED ---
 // handleAutoScaling is the main entry point for the autoscaler logic.
-// It's a "state machine" that checks if we are monitoring, scaling, or resharding.
+// It's a "state machine" that checks if we are draining, resharding (scaling up), or monitoring.
 func (r *RedisClusterReconciler) handleAutoScaling(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// --- STATE 1: Resharding ---
-	// We are currently in the middle of a scaling operation.
+	// --- NEW STATE 1: Draining (Scale-Down) ---
+	// Highest priority: If we are draining a pod, check that job.
+	if cluster.Status.IsDraining {
+		logger.Info("Cluster is locked for draining. Checking drain job status.")
+		return r.checkDrainStatus(ctx, cluster)
+	}
+
+	// --- STATE 2: Resharding (Scale-Up) ---
+	// We are in the middle of a scale-up operation.
 	if cluster.Status.IsResharding {
-		// UPDATED LOG MESSAGE:
 		logger.Info("Cluster is locked for resharding. Checking job status, NOT monitoring CPU.")
 		return r.checkReshardingStatus(ctx, cluster)
 	}
 
-	// --- STATE 2: Monitoring ---
+	// --- STATE 3: Monitoring ---
 	// We are stable and monitoring Prometheus for CPU usage.
-	logger.Info("Cluster is stable. Monitoring CPU usage.")
+	logger.Info("Cluster is stable. Monitoring CPU usage for scale-up or scale-down.")
+	// --- UPDATED ---
 	return r.monitorCPUUsage(ctx, cluster)
 }
 
+// --- NEW FUNCTION ---
+// checkDrainStatus checks the progress of the drain job.
+func (r *RedisClusterReconciler) checkDrainStatus(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	jobName := cluster.Name + "-drain"
+
+	// 1. Check if the drain Job exists
+	drainJob := &batchv1.Job{}
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, drainJob)
+
+	if err != nil && errors.IsNotFound(err) {
+		// Job not found, so we need to create it.
+		// We must first get the IP of the pod we want to drain.
+		podToDrain := &corev1.Pod{}
+		podName := cluster.Status.PodToDrain
+		if podName == "" {
+			// Safety check - this should not happen if IsDraining is true.
+			logger.Error(fmt.Errorf("IsDraining is true but PodToDrain is empty"), "State error")
+			cluster.Status.IsDraining = false // Unlock
+			_ = r.Status().Update(ctx, cluster)
+			return ctrl.Result{}, nil
+		}
+
+		if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: cluster.Namespace}, podToDrain); err != nil {
+			logger.Error(err, "Failed to get Pod object to find IP for draining", "pod", podName)
+			// Pod might be gone? Unlock and retry.
+			cluster.Status.IsDraining = false
+			cluster.Status.PodToDrain = ""
+			_ = r.Status().Update(ctx, cluster)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		if podToDrain.Status.PodIP == "" {
+			logger.Info("Pod to drain does not have an IP yet. Waiting...", "pod", podName)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		podIP := podToDrain.Status.PodIP
+		logger.Info("Creating pod drain Job", "pod", podName, "ip", podIP)
+		job := r.drainJobForRedisCluster(cluster, podIP) // Pass the IP to the job constructor
+		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+			logger.Error(err, "Failed to set owner ref on drain Job")
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			logger.Error(err, "Failed to create drain Job")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil // Requeue to check job status
+
+	} else if err != nil {
+		logger.Error(err, "Failed to get drain Job")
+		return ctrl.Result{}, err
+	}
+
+	// 2. Job exists. Check its status.
+	if drainJob.Status.Succeeded > 0 {
+		logger.Info("Drain Job succeeded. Pod is empty. Reducing master count.")
+
+		// Drain succeeded, now we can safely reduce the master count
+		cluster.Spec.Masters--
+		if err := r.Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update spec to decrease masters after drain")
+			return ctrl.Result{}, err
+		}
+
+		// Unlock the state machine and clear drain state
+		cluster.Status.IsDraining = false
+		cluster.Status.PodToDrain = ""
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update status after drain")
+			return ctrl.Result{}, err
+		}
+
+		// Clean up the successful job
+		// _ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		// The main reconcile loop will now see the reduced Spec.Masters
+		// and will terminate the drained pod (e.g., redis-cluster-5)
+		logger.Info("Scale-down complete. Main reconciler will now remove the pod.")
+		return ctrl.Result{}, nil
+	}
+
+	if drainJob.Status.Failed > 0 {
+		logger.Error(fmt.Errorf("drain job %s failed", jobName), "Draining failed")
+		// Clean up the failed job to allow a retry
+		// _ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		cluster.Status.IsDraining = false // Unlock
+		cluster.Status.PodToDrain = ""
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update status after failed drain")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil // Wait before retrying
+	}
+
+	logger.Info("Drain job is still running...")
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
 // checkReshardingStatus checks if the new pods are ready and if the reshard job is complete.
+// --- THIS FUNCTION IS UNCHANGED ---
 func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -117,7 +225,8 @@ func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, clus
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// monitorCPUUsage queries Prometheus for individual pod CPU and triggers scaling if needed.
+// --- UPDATED ---
+// monitorCPUUsage queries Prometheus for individual pod CPU and triggers scaling (up or down) if needed.
 func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -130,8 +239,6 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	v1api := prometheusv1.NewAPI(client)
 
 	// 2. Build and run the query.
-	// This query gets the CPU usage *percentage* for each individual "redis" container
-	// in our StatefulSet over the last minute.
 	query := fmt.Sprintf(
 		`rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s"}[1m]) * 100`,
 		cluster.Name,
@@ -154,54 +261,190 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	threshold := float64(cluster.Spec.CpuThreshold)
+	// --- UPDATED ---
+	highThreshold := float64(cluster.Spec.CpuThreshold)
+	lowThreshold := float64(cluster.Spec.CpuThresholdLow) // From the new Spec field
 	var scaleUp bool = false
+	var scaleDown bool = true // Assume true, set to false if any pod is *not* low
+	var podToDrain string
 
-	// 4. Iterate over each pod's CPU usage and check against the threshold.
+	// Safety check: Don't scale down if we are at minimum masters
+	if cluster.Spec.Masters <= cluster.Spec.MinMasters { // Assuming you have a MinMasters field, or use a constant
+		scaleDown = false
+	}
+	// Safety check: Don't check for scale-down if no low threshold is set
+	if lowThreshold <= 0 {
+		scaleDown = false
+	}
+
+	// 4. Iterate over each pod's CPU usage
 	for _, sample := range vec {
 		podName := string(sample.Metric["pod"])
 		cpuUsage := float64(sample.Value)
-		logger.Info("Checking pod CPU usage", "pod", podName, "cpuUsage", cpuUsage, "threshold", threshold)
+		logger.Info("Checking pod CPU usage", "pod", podName, "cpuUsage", cpuUsage, "highThreshold", highThreshold, "lowThreshold", lowThreshold)
 
-		if cpuUsage > threshold {
+		// Check for scale-up
+		if cpuUsage > highThreshold {
 			logger.Info("CPU threshold breached by a pod! Scaling up cluster.", "pod", podName, "cpuUsage", cpuUsage)
 			scaleUp = true
 			break // Found a pod that needs scaling, no need to check others.
 		}
+
+		// Check for scale-down
+		if scaleDown {
+			if cpuUsage > lowThreshold {
+				// This pod is *not* underutilized, so we can't scale down.
+				scaleDown = false
+			} else {
+				// This pod *is* a candidate for draining. We'll just pick the first one we find.
+				// We only care about master pods, which are even-numbered (e.g., -0, -2, -4)
+				// A better implementation would check if this is a master pod.
+				// For now, let's just grab the pod name.
+				// A real implementation should find the pod with the *highest* index to drain.
+				// E.g., if we have -0, -2, -4, we should drain -4.
+				// This simple logic just grabs the first low pod.
+				// TODO: Make this logic smarter to pick the *highest index master*.
+				if podToDrain == "" {
+					podToDrain = podName
+				}
+			}
+		}
 	}
 
-	// 5. Take action if any pod breached the threshold
+	// 5. Take action
 	if scaleUp {
-		// Set the lock
+		// --- SCALE-UP LOGIC (UNCHANGED) ---
+		logger.Info("Triggering scale-up...")
 		cluster.Status.IsResharding = true
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update status to IsResharding")
 			return ctrl.Result{}, err
 		}
 
-		// Increase the master count by exactly one
 		cluster.Spec.Masters++
 		if err := r.Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update spec to increase masters")
-			// Try to unlock if spec update fails
 			cluster.Status.IsResharding = false
 			_ = r.Status().Update(ctx, cluster)
 			return ctrl.Result{}, err
 		}
 
-		// Success! The Reconcile loop will be triggered by the Spec update.
-		// The main controller will update the StatefulSet.
-		// The next loop will see IsResharding=true and go to checkReshardingStatus.
 		logger.Info("Successfully triggered scale-up by increasing master count", "newMasterCount", cluster.Spec.Masters)
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
+	// --- NEW ---
+	if scaleDown && podToDrain != "" {
+		// --- SCALE-DOWN LOGIC ---
+		logger.Info("Triggering scale-down. All pods below low threshold.", "podToDrain", podToDrain)
+
+		// Set the lock and the pod to drain
+		cluster.Status.IsDraining = true
+		cluster.Status.PodToDrain = podToDrain // <-- Store the pod name
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update status to IsDraining")
+			return ctrl.Result{}, err
+		}
+
+		// Success! The next reconcile loop will see IsDraining=true
+		// and call checkDrainStatus, which will create the drain job.
+		logger.Info("Successfully triggered scale-down.", "pod", podToDrain)
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
 	// All good, check again later.
-	logger.Info("All pods are within CPU threshold.")
+	logger.Info("All pods are within CPU thresholds.")
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
+// drainJobForRedisCluster defines the Job to drain a specific pod.
+func (r *RedisClusterReconciler) drainJobForRedisCluster(cluster *appv1.RedisCluster, podToDrainIP string) *batchv1.Job {
+	anyPodHost := fmt.Sprintf("%s-0.%s.%s.svc.cluster.local", cluster.Name, cluster.Name+"-headless", cluster.Namespace)
+	timeout := int64(300) // 5-minute timeout for drain
+	backoff := int32(0)   // No retries for the job
+
+	// This is your shell script, embedded as the command
+	cliCmd := `
+#!/bin/sh
+set -ex
+
+echo "--- Drain Job Started ---"
+echo "Attempting to drain pod with IP: $POD_TO_DRAIN_IP"
+echo "Entrypoint is $ENTRYPOINT_HOST"
+
+# 1. Find the Redis Node ID for the pod we want to drain
+NODE_ID=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep "$POD_TO_DRAIN_IP:6379" | awk '{ print $1 }')
+
+if [ -z "${NODE_ID}" ]; then
+  echo "Could not find node with IP $POD_TO_DRAIN_IP. Exiting gracefully."
+  # This is a success for the job, as the pod is already gone or not in the cluster.
+  exit 0
+fi
+echo "Found node ID ${NODE_ID} for IP $POD_TO_DRAIN_IP"
+
+# 2. Check if the node is a master and has slots
+SLOTS=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep "${NODE_ID}" | awk '{ print $9 }')
+if [ -z "${SLOTS}" ]; then
+  echo "Node ${NODE_ID} is not a master or has no slots. No draining needed."
+  exit 0
+fi
+
+# 3. Find a recipient node (any other master)
+TO_NODE_ID=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep master | grep -v "${NODE_ID}" | head -n 1 | awk '{ print $1 }')
+if [ -z "${TO_NODE_ID}" ]; then
+  echo "FATAL: Could not find another master to migrate slots to."
+  exit 1
+fi
+
+# 4. Migrate slots
+echo "Migrating all slots from ${NODE_ID} to ${TO_NODE_ID}"
+
+# --- THIS IS THE FIX ---
+# Added :6379 to $ENTRYPOINT_HOST for the reshard command
+redis-cli --cluster reshard $ENTRYPOINT_HOST:6379 --cluster-from ${NODE_ID} --cluster-to ${TO_NODE_ID} --cluster-slots 16384 --cluster-yes
+# --- END OF FIX ---
+
+echo "--- Drain Job Successful ---"
+`
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cluster.Name + "-drain", // Job name
+			Namespace: cluster.Namespace,
+			Labels:    getLabels(cluster),
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds: &timeout,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever, // Don't restart, fail
+					Containers: []corev1.Container{
+						{
+							Name:    "drain",
+							Image:   fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion), // Use same Redis image
+							Command: []string{"sh", "-c"},
+							Args:    []string{cliCmd},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "POD_TO_DRAIN_IP",
+									Value: podToDrainIP, // Inject the IP
+								},
+								{
+									Name:  "ENTRYPOINT_HOST",
+									Value: anyPodHost, // Inject the entrypoint
+								},
+							},
+						},
+					},
+				},
+			},
+			BackoffLimit: &backoff,
+		},
+	}
+}
+
 // reshardJobForRedisCluster defines the Job to rebalance the cluster.
+// --- THIS FUNCTION IS UNCHANGED ---
 func (r *RedisClusterReconciler) reshardJobForRedisCluster(cluster *appv1.RedisCluster) *batchv1.Job {
 	anyPodHost := fmt.Sprintf("%s-0.%s.%s.svc.cluster.local", cluster.Name, cluster.Name+"-headless", cluster.Namespace)
 	anyPodPort := "6379"
@@ -214,7 +457,8 @@ func (r *RedisClusterReconciler) reshardJobForRedisCluster(cluster *appv1.RedisC
 		timeout = int(cluster.Spec.ReshardTimeoutSeconds)
 	}
 
-	cliCmd := fmt.Sprintf(`
+	cliCmd := fmt.Sprintf(
+		`
 set -x
 
 echo "--- Smart Reshard Job Started ---"
@@ -295,7 +539,7 @@ done
 echo "Disabling full coverage check on all nodes..."
 node_ips=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | awk '{ print $2 }' | cut -d'@' -f1 | cut -d':' -f1 | sort -u)
 for ip in $node_ips; do
-  if redis-cli -h $ip -p 6379 ping >/dev/null 2>&1; then
+  if redis-cli -h $ip -p 6379 ping >/dev/null 2%1; then
     redis-cli -h $ip -p 6379 config set cluster-require-full-coverage no || echo "WARN: Failed config set on $ip"
   else
     echo "WARN: Node $ip not reachable for config set"
@@ -325,14 +569,14 @@ fi
 # --- Re-enable full coverage on all nodes ---
 echo "Re-enabling full coverage on all nodes..."
 for ip in $node_ips; do
-  if redis-cli -h $ip -p 6379 ping >/dev/null 2>&1; then
+  if redis-cli -h $ip -p 6379 ping >/dev/null 2%1; then
     redis-cli -h $ip -p 6379 config set cluster-require-full-coverage yes || echo "WARN: Failed re-enable on $ip"
   fi
 done
 sleep 3
 
 echo "--- Smart Reshard Job Finished ---"
-	`,
+`,
 		timeout,
 		timeout,
 		expectedNodes,

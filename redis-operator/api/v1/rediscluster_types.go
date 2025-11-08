@@ -27,10 +27,13 @@ import (
 type RedisClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Masters int32 `json:"masters"`
+	// +kubebuilder:default=3
+	MinMasters int32 `json:"minMasters"`
 	// +kubebuilder:validation:Minimum=0
 	ReplicasPerMaster int32  `json:"replicasPerMaster"`
 	AutoScaleEnabled  bool   `json:"autoScaleEnabled"`
 	CpuThreshold      int32  `json:"cpuThreshold"`
+	CpuThresholdLow   int32  `json:"cpuThresholdLow,omitempty"`
 	RedisVersion      string `json:"redisVersion,omitempty"`
 	// +kubebuilder:validation:Minimum=60
 	// +kubebuilder:validation:Maximum=3600
@@ -49,6 +52,10 @@ type RedisClusterStatus struct {
 	IsResharding bool `json:"isResharding,omitempty"`
 	// +optional
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
+	// IsDraining locks the autoscaler while a pod is being drained for scale-down.
+	IsDraining bool `json:"isDraining,omitempty"`
+	// PodToDrain stores the name of the pod selected for draining.
+	PodToDrain string `json:"podToDrain,omitempty"`
 }
 
 // +kubebuilder:object:root=true

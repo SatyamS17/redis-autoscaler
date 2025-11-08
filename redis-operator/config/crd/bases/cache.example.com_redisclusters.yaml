@@ -44,9 +44,16 @@ spec:
               cpuThreshold:
                 format: int32
                 type: integer
+              cpuThresholdLow:
+                format: int32
+                type: integer
               masters:
                 format: int32
                 minimum: 1
+                type: integer
+              minMasters:
+                default: 3
+                format: int32
                 type: integer
               redisVersion:
                 type: string
@@ -64,6 +71,7 @@ spec:
             - autoScaleEnabled
             - cpuThreshold
             - masters
+            - minMasters
             - replicasPerMaster
             type: object
           status:
@@ -80,10 +88,17 @@ spec:
                 type: integer
               initialized:
                 type: boolean
+              isDraining:
+                description: IsDraining locks the autoscaler while a pod is being
+                  drained for scale-down.
+                type: boolean
               isResharding:
                 type: boolean
               lastScaleTime:
                 format: date-time
+                type: string
+              podToDrain:
+                description: PodToDrain stores the name of the pod selected for draining.
                 type: string
             required:
             - avgCpuUsage
