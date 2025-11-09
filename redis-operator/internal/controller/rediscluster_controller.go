@@ -167,15 +167,18 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
 		logger.Info("Cluster is initialized, checking autoscaler")
 
-		// Check if we're in cooldown period (1 minute)
-		if cluster.Status.LastScaleTime != nil {
-			cooldownPeriod := time.Minute
-			timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
-			if timeSinceLastScale < cooldownPeriod {
-				logger.Info("In cooldown period, skipping autoscaling",
-					"timeSinceLastScale", timeSinceLastScale.String(),
-					"cooldownPeriod", cooldownPeriod.String())
-				return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
+		// Only check cooldown if we're NOT already in a scaling operation
+		if !cluster.Status.IsResharding && !cluster.Status.IsDraining {
+			// Check if we're in cooldown period (1 minute)
+			if cluster.Status.LastScaleTime != nil {
+				cooldownPeriod := time.Minute
+				timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
+				if timeSinceLastScale < cooldownPeriod {
+					logger.Info("In cooldown period, skipping autoscaling",
+						"timeSinceLastScale", timeSinceLastScale.String(),
+						"cooldownPeriod", cooldownPeriod.String())
+					return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
+				}
 			}
 		}
 
@@ -186,23 +189,16 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 
-		// Update LastScaleTime if scaling operation was performed
-		if result.RequeueAfter == 1*time.Second {
-			logger.Info("Scale-up detected, setting cooldown timer.")
+		// Update LastScaleTime ONLY when we initiate a NEW scale operation
+		// (detected by the 1-second requeue AND not already scaling)
+		if result.RequeueAfter == 1*time.Second && !cluster.Status.IsResharding && !cluster.Status.IsDraining {
+			logger.Info("Scale operation initiated, setting cooldown timer.")
 			now := metav1.Now()
 			cluster.Status.LastScaleTime = &now
 			if err := r.Status().Update(ctx, cluster); err != nil {
 				logger.Error(err, "Failed to update LastScaleTime")
 				// Don't block the requeue, just log the error
 			}
-			// Pass along the 1-second requeue to trigger the cooldown check
-			return result, nil
-		}
-
-		// If it was any other requeue (like from checkReshardingStatus),
-		// just return the result without resetting the cooldown.
-		if result.RequeueAfter > 0 {
-			return result, nil
 		}
 
 		return result, nil

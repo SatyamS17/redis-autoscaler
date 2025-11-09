@@ -122,6 +122,7 @@ func (r *RedisClusterReconciler) checkDrainStatus(ctx context.Context, cluster *
 		// Unlock the state machine and clear drain state
 		cluster.Status.IsDraining = false
 		cluster.Status.PodToDrain = ""
+
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update status after drain")
 			return ctrl.Result{}, err
@@ -225,7 +226,7 @@ func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, clus
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// --- UPDATED ---
+// --- UPDATED FUNCTION ---
 // monitorCPUUsage queries Prometheus for individual pod CPU and triggers scaling (up or down) if needed.
 func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -261,19 +262,21 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// --- UPDATED ---
 	highThreshold := float64(cluster.Spec.CpuThreshold)
-	lowThreshold := float64(cluster.Spec.CpuThresholdLow) // From the new Spec field
+	lowThreshold := float64(cluster.Spec.CpuThresholdLow)
 	var scaleUp bool = false
 	var scaleDown bool = true // Assume true, set to false if any pod is *not* low
-	var podToDrain string
 
-	// Safety check: Don't scale down if we are at minimum masters
-	if cluster.Spec.Masters <= cluster.Spec.MinMasters { // Assuming you have a MinMasters field, or use a constant
-		scaleDown = false
-	}
 	// Safety check: Don't check for scale-down if no low threshold is set
 	if lowThreshold <= 0 {
+		scaleDown = false
+	}
+
+	// --- THIS IS THE MINIMUM MASTER CHECK ---
+	// You should use a real Spec field, e.g., cluster.Spec.MinMasters
+	// Using '3' as a placeholder.
+	minMasters := int32(3)
+	if cluster.Spec.Masters <= minMasters {
 		scaleDown = false
 	}
 
@@ -290,25 +293,13 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 			break // Found a pod that needs scaling, no need to check others.
 		}
 
-		// Check for scale-down
-		if scaleDown {
-			if cpuUsage > lowThreshold {
-				// This pod is *not* underutilized, so we can't scale down.
-				scaleDown = false
-			} else {
-				// This pod *is* a candidate for draining. We'll just pick the first one we find.
-				// We only care about master pods, which are even-numbered (e.g., -0, -2, -4)
-				// A better implementation would check if this is a master pod.
-				// For now, let's just grab the pod name.
-				// A real implementation should find the pod with the *highest* index to drain.
-				// E.g., if we have -0, -2, -4, we should drain -4.
-				// This simple logic just grabs the first low pod.
-				// TODO: Make this logic smarter to pick the *highest index master*.
-				if podToDrain == "" {
-					podToDrain = podName
-				}
-			}
+		// --- UPDATED SCALE-DOWN CHECK ---
+		// We only care if *any* pod is *above* the low threshold.
+		if scaleDown && cpuUsage > lowThreshold {
+			// This pod is *not* underutilized, so we can't scale down.
+			scaleDown = false
 		}
+		// We no longer save the 'podToDrain' name here.
 	}
 
 	// 5. Take action
@@ -333,14 +324,22 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
-	// --- NEW ---
-	if scaleDown && podToDrain != "" {
-		// --- SCALE-DOWN LOGIC ---
+	// --- CORRECTED SCALE-DOWN LOGIC ---
+	if scaleDown {
+		// All pods are under threshold. Time to scale down.
+		// We MUST drain the highest-index master.
+
+		// This calculation finds the pod index for the highest master.
+		// Example: 4 Masters, 1 Replica -> (4-1)*(1+1) = 6. Pod: "cluster-6"
+		// Example: 3 Masters, 1 Replica -> (3-1)*(1+1) = 4. Pod: "cluster-4"
+		podIndexToDrain := (cluster.Spec.Masters - 1) * (1 + cluster.Spec.ReplicasPerMaster)
+		podToDrain := fmt.Sprintf("%s-%d", cluster.Name, podIndexToDrain)
+
 		logger.Info("Triggering scale-down. All pods below low threshold.", "podToDrain", podToDrain)
 
-		// Set the lock and the pod to drain
+		// Set the lock and the *correct* pod to drain
 		cluster.Status.IsDraining = true
-		cluster.Status.PodToDrain = podToDrain // <-- Store the pod name
+		cluster.Status.PodToDrain = podToDrain // <-- This is now correct
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update status to IsDraining")
 			return ctrl.Result{}, err
@@ -357,27 +356,28 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
-// drainJobForRedisCluster defines the Job to drain a specific pod.
+// --- THIS IS THE CORRECTED FUNCTION ---
+// Replace the old one in your Go code with this.
+// drainJobForRedisCluster defines the Job to drain and safely remove a pod.
 func (r *RedisClusterReconciler) drainJobForRedisCluster(cluster *appv1.RedisCluster, podToDrainIP string) *batchv1.Job {
 	anyPodHost := fmt.Sprintf("%s-0.%s.%s.svc.cluster.local", cluster.Name, cluster.Name+"-headless", cluster.Namespace)
-	timeout := int64(300) // 5-minute timeout for drain
-	backoff := int32(0)   // No retries for the job
+	entrypointWithPort := fmt.Sprintf("%s:6379", anyPodHost) // Needed for reshard/del-node
+	timeout := int64(600)                                    // Increased timeout for drain + delete
+	backoff := int32(0)
 
-	// This is your shell script, embedded as the command
 	cliCmd := `
 #!/bin/sh
 set -ex
 
-echo "--- Drain Job Started ---"
-echo "Attempting to drain pod with IP: $POD_TO_DRAIN_IP"
-echo "Entrypoint is $ENTRYPOINT_HOST"
+echo "--- Drain & Delete Job Started ---"
+echo "Target Pod IP: $POD_TO_DRAIN_IP"
+echo "Entrypoint: $ENTRYPOINT_WITH_PORT"
 
 # 1. Find the Redis Node ID for the pod we want to drain
 NODE_ID=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep "$POD_TO_DRAIN_IP:6379" | awk '{ print $1 }')
 
 if [ -z "${NODE_ID}" ]; then
-  echo "Could not find node with IP $POD_TO_DRAIN_IP. Exiting gracefully."
-  # This is a success for the job, as the pod is already gone or not in the cluster.
+  echo "Could not find node with IP $POD_TO_DRAIN_IP. Assuming already gone. Exiting gracefully."
   exit 0
 fi
 echo "Found node ID ${NODE_ID} for IP $POD_TO_DRAIN_IP"
@@ -385,26 +385,58 @@ echo "Found node ID ${NODE_ID} for IP $POD_TO_DRAIN_IP"
 # 2. Check if the node is a master and has slots
 SLOTS=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep "${NODE_ID}" | awk '{ print $9 }')
 if [ -z "${SLOTS}" ]; then
-  echo "Node ${NODE_ID} is not a master or has no slots. No draining needed."
-  exit 0
+  echo "Node ${NODE_ID} is not a master or has no slots. Draining not needed."
+else
+  # 3. Find a recipient node (any other master)
+  TO_NODE_ID=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep master | grep -v "${NODE_ID}" | head -n 1 | awk '{ print $1 }')
+  if [ -z "${TO_NODE_ID}" ]; then
+    echo "FATAL: Could not find another master to migrate slots to."
+    exit 1
+  fi
+
+  # 4. Migrate slots
+  echo "Migrating all slots from ${NODE_ID} to ${TO_NODE_ID}"
+  redis-cli --cluster reshard $ENTRYPOINT_WITH_PORT --cluster-from ${NODE_ID} --cluster-to ${TO_NODE_ID} --cluster-slots 16384 --cluster-yes
 fi
 
-# 3. Find a recipient node (any other master)
-TO_NODE_ID=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | grep master | grep -v "${NODE_ID}" | head -n 1 | awk '{ print $1 }')
-if [ -z "${TO_NODE_ID}" ]; then
-  echo "FATAL: Could not find another master to migrate slots to."
-  exit 1
+# --- CORRECTED LOGIC ---
+
+echo "Drain complete. Now safely removing nodes from cluster."
+
+# 5. Find ALL replicas of the drained master
+# Use awk to find slaves where field 4 (master_id) matches our NODE_ID
+REPLICA_IDS=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | awk -v master_id="${NODE_ID}" '$3 == "slave" && $4 == master_id { print $1 }' || true)
+
+if [ -n "${REPLICA_IDS}" ]; then
+  echo "Found replicas: ${REPLICA_IDS}. Removing them from the cluster first."
+  
+  # Loop through each ID (it's a multi-line string)
+  for rep_id in ${REPLICA_IDS}; do
+    echo "Removing replica ${rep_id}..."
+    # Send command, retry once if it fails
+    redis-cli --cluster del-node $ENTRYPOINT_WITH_PORT ${rep_id} || \
+      (sleep 5 && redis-cli --cluster del-node $ENTRYPOINT_WITH_PORT ${rep_id})
+    echo "Replica ${rep_id} removal command sent."
+    sleep 2 # Small pause
+  done
+  
+  sleep 5 # Give cluster time to update after all replicas are gone
+else
+  echo "WARN: Could not find any replicas for master ${NODE_ID}. Proceeding to remove master."
 fi
 
-# 4. Migrate slots
-echo "Migrating all slots from ${NODE_ID} to ${TO_NODE_ID}"
+# 6. Remove the (now empty) master node
+echo "Removing drained master ${NODE_ID} from the cluster."
+redis-cli --cluster del-node $ENTRYPOINT_WITH_PORT ${NODE_ID} || \
+  (sleep 5 && redis-cli --cluster del-node $ENTRYPOINT_WITH_PORT ${NODE_ID})
+echo "Master removal command sent."
 
-# --- THIS IS THE FIX ---
-# Added :6379 to $ENTRYPOINT_HOST for the reshard command
-redis-cli --cluster reshard $ENTRYPOINT_HOST:6379 --cluster-from ${NODE_ID} --cluster-to ${TO_NODE_ID} --cluster-slots 16384 --cluster-yes
-# --- END OF FIX ---
+# 7. Final check
+sleep 5
+echo "Final cluster state:"
+redis-cli -h $ENTRYPOINT_HOST cluster nodes
 
-echo "--- Drain Job Successful ---"
+echo "--- Drain & Delete Job Successful ---"
 `
 
 	return &batchv1.Job{
@@ -417,21 +449,25 @@ echo "--- Drain Job Successful ---"
 			ActiveDeadlineSeconds: &timeout,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever, // Don't restart, fail
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
 							Name:    "drain",
-							Image:   fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion), // Use same Redis image
+							Image:   fmt.Sprintf("redis:%s", cluster.Spec.RedisVersion),
 							Command: []string{"sh", "-c"},
 							Args:    []string{cliCmd},
 							Env: []corev1.EnvVar{
 								{
 									Name:  "POD_TO_DRAIN_IP",
-									Value: podToDrainIP, // Inject the IP
+									Value: podToDrainIP,
 								},
 								{
-									Name:  "ENTRYPOINT_HOST",
-									Value: anyPodHost, // Inject the entrypoint
+									Name:  "ENTRYPOINT_HOST", // Hostname without port
+									Value: anyPodHost,
+								},
+								{
+									Name:  "ENTRYPOINT_WITH_PORT", // Hostname:port
+									Value: entrypointWithPort,
 								},
 							},
 						},
