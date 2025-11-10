@@ -70,8 +70,9 @@ kubectl apply -f cluster.yaml
 echo "Waiting 60s for Redis pods to be created..."
 sleep 60
 
-# 4. Check Redis Cluster Slots
-
+# # 4. Check Redis Cluster Slots
+# echo "Applying VPA yaml..."
+# kubectl apply -f vpa.yaml
 
 # 5. Tail Operator Logs
 echo "--- [4/4] Tailing Operator Logs ---"

@@ -166,6 +166,11 @@ func (r *RedisClusterReconciler) checkReshardingStatus(ctx context.Context, clus
 	}
 
 	desiredTotalReplicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	if *sts.Spec.Replicas != desiredTotalReplicas {
+		logger.Info("StatefulSet spec not updated yet", "Current", *sts.Spec.Replicas, "Desired", desiredTotalReplicas)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	if sts.Status.ReadyReplicas != desiredTotalReplicas {
 		logger.Info("Resharding: Waiting for new pods to be ready", "Ready", sts.Status.ReadyReplicas, "Desired", desiredTotalReplicas)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -488,6 +493,7 @@ func (r *RedisClusterReconciler) reshardJobForRedisCluster(cluster *appv1.RedisC
 
 	serviceName := cluster.Name + "-headless"
 	expectedNodes := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+
 	timeout := 300
 	if cluster.Spec.ReshardTimeoutSeconds > 0 {
 		timeout = int(cluster.Spec.ReshardTimeoutSeconds)

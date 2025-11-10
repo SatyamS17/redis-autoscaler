@@ -41,6 +41,16 @@ spec:
             properties:
               autoScaleEnabled:
                 type: boolean
+              cpuQueryDuration:
+                default: 1m
+                description: |-
+                  CPUQueryDuration is the duration for the anti-jitter CPU average.
+                  (e.g., "10m" for stable, "1m" for testing)
+                type: string
+              cpuQueryWindow:
+                default: 1m
+                description: CPUQueryWindow is the rate window for the CPU query.
+                type: string
               cpuThreshold:
                 format: int32
                 type: integer
@@ -48,6 +58,14 @@ spec:
                 format: int32
                 type: integer
               masters:
+                format: int32
+                minimum: 1
+                type: integer
+              memoryHighThreshold:
+                default: 80
+                description: |-
+                  MemoryHighThreshold is the percent of memory usage (vs. request)
+                  that triggers a vertical scale-up.
                 format: int32
                 minimum: 1
                 type: integer
@@ -93,6 +111,8 @@ spec:
                   drained for scale-down.
                 type: boolean
               isResharding:
+                type: boolean
+              isVerticallyScaling:
                 type: boolean
               lastScaleTime:
                 format: date-time
