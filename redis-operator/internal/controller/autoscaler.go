@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
@@ -17,6 +18,11 @@ import (
 // PromServiceURL is the hardcoded location of your Prometheus server.
 // TODO: Make this configurable!
 const PromServiceURL = "http://prometheus-operated.monitoring.svc:9090"
+
+type PodLoad struct {
+	PodName  string
+	CPUUsage float64
+}
 
 // --- UPDATED ---
 // handleAutoScaling is the main entry point for the autoscaler logic.
@@ -45,12 +51,11 @@ func (r *RedisClusterReconciler) handleAutoScaling(ctx context.Context, cluster 
 	return r.monitorCPUUsage(ctx, cluster)
 }
 
-// --- UPDATED FUNCTION ---
-// monitorCPUUsage queries Prometheus for individual pod CPU and triggers scaling (up or down) if needed.
+// monitorCPUUsage identifies the most/least loaded pods and triggers smart scaling
 func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. Set up Prometheus client
+	// 1. Query Prometheus
 	client, err := api.NewClient(api.Config{Address: PromServiceURL})
 	if err != nil {
 		logger.Error(err, "Error creating Prometheus client")
@@ -58,9 +63,9 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	}
 	v1api := prometheusv1.NewAPI(client)
 
-	// 2. Build and run the query.
 	query := fmt.Sprintf(
-		`rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s"}[1m]) * 100`,
+		`rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s", service="kps-kube-prometheus-stack-kubelet"}[1m]) * 100
+	 and on(pod) redis_instance_info{role="master"}`,
 		cluster.Name,
 		cluster.Namespace,
 	)
@@ -74,103 +79,153 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		logger.Info("Prometheus warnings", "warnings", warnings)
 	}
 
-	// 3. Parse the result
 	vec, ok := result.(model.Vector)
 	if !ok || vec.Len() == 0 {
 		logger.Info("Prometheus query returned no data. Skipping check.")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	highThreshold := float64(cluster.Spec.CpuThreshold)
-	lowThreshold := float64(cluster.Spec.CpuThresholdLow)
-	var scaleUp bool = false
-	var scaleDown bool = true // Assume true, set to false if any pod is *not* low
-
-	// Safety check: Don't check for scale-down if no low threshold is set
-	if lowThreshold <= 0 {
-		scaleDown = false
-	}
-
-	// --- THIS IS THE MINIMUM MASTER CHECK ---
-	// You should use a real Spec field, e.g., cluster.Spec.MinMasters
-	// Using '3' as a placeholder.
-	minMasters := int32(3)
-	if cluster.Spec.Masters <= minMasters {
-		scaleDown = false
-	}
-
-	// 4. Iterate over each pod's CPU usage
+	// 2. Collect all pod loads
+	var podLoads []PodLoad
 	for _, sample := range vec {
 		podName := string(sample.Metric["pod"])
 		cpuUsage := float64(sample.Value)
-		logger.Info("Checking pod CPU usage", "pod", podName, "cpuUsage", cpuUsage, "highThreshold", highThreshold, "lowThreshold", lowThreshold)
-
-		// Check for scale-up
-		if cpuUsage > highThreshold {
-			logger.Info("CPU threshold breached by a pod! Scaling up cluster.", "pod", podName, "cpuUsage", cpuUsage)
-			scaleUp = true
-			break // Found a pod that needs scaling, no need to check others.
-		}
-
-		// --- UPDATED SCALE-DOWN CHECK ---
-		// We only care if *any* pod is *above* the low threshold.
-		if scaleDown && cpuUsage > lowThreshold {
-			// This pod is *not* underutilized, so we can't scale down.
-			scaleDown = false
-		}
-		// We no longer save the 'podToDrain' name here.
+		podLoads = append(podLoads, PodLoad{
+			PodName:  podName,
+			CPUUsage: cpuUsage,
+		})
+		logger.Info("Pod CPU usage", "pod", podName, "cpu", cpuUsage)
 	}
 
-	// 5. Take action
-	if scaleUp {
-		// --- SCALE-UP LOGIC (UNCHANGED) ---
-		logger.Info("Triggering scale-up...")
+	if len(podLoads) == 0 {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	// 3. Find max loaded pod
+	maxLoad := podLoads[0]
+	for _, pod := range podLoads {
+		if pod.CPUUsage > maxLoad.CPUUsage {
+			maxLoad = pod
+		}
+	}
+
+	highThreshold := float64(cluster.Spec.CpuThreshold)
+	lowThreshold := float64(cluster.Spec.CpuThresholdLow)
+	minMasters := int32(3)
+
+	// 4. SCALE-UP DECISION: if max pod exceeds threshold
+	if maxLoad.CPUUsage > highThreshold {
+		logger.Info("Triggering scale-up due to overloaded pod",
+			"pod", maxLoad.PodName,
+			"cpu", maxLoad.CPUUsage,
+			"threshold", highThreshold,
+		)
+
+		// Set the lock and store which pod is overloaded
 		cluster.Status.IsResharding = true
+		cluster.Status.OverloadedPod = maxLoad.PodName
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update status to IsResharding")
 			return ctrl.Result{}, err
 		}
 
+		// Increment master count
 		cluster.Spec.Masters++
 		if err := r.Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update spec to increase masters")
 			cluster.Status.IsResharding = false
+			cluster.Status.OverloadedPod = ""
 			_ = r.Status().Update(ctx, cluster)
 			return ctrl.Result{}, err
 		}
 
-		logger.Info("Successfully triggered scale-up by increasing master count", "newMasterCount", cluster.Spec.Masters)
+		logger.Info("Successfully triggered scale-up", "newMasterCount", cluster.Spec.Masters)
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 
-	// --- CORRECTED SCALE-DOWN LOGIC ---
-	if scaleDown {
-		// All pods are under threshold. Time to scale down.
-		// We MUST drain the highest-index master.
-
-		// This calculation finds the pod index for the highest master.
-		// Example: 4 Masters, 1 Replica -> (4-1)*(1+1) = 6. Pod: "cluster-6"
-		// Example: 3 Masters, 1 Replica -> (3-1)*(1+1) = 4. Pod: "cluster-4"
-		podIndexToDrain := (cluster.Spec.Masters - 1) * (1 + cluster.Spec.ReplicasPerMaster)
-		podToDrain := fmt.Sprintf("%s-%d", cluster.Name, podIndexToDrain)
-
-		logger.Info("Triggering scale-down. All pods below low threshold.", "podToDrain", podToDrain)
-
-		// Set the lock and the *correct* pod to drain
-		cluster.Status.IsDraining = true
-		cluster.Status.PodToDrain = podToDrain // <-- This is now correct
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			logger.Error(err, "Failed to update status to IsDraining")
-			return ctrl.Result{}, err
+	// 5. SCALE-DOWN DECISION: if ALL pods are under low threshold
+	if lowThreshold > 0 && cluster.Spec.Masters > minMasters {
+		allUnderThreshold := true
+		for _, pod := range podLoads {
+			if pod.CPUUsage > lowThreshold {
+				allUnderThreshold = false
+				break
+			}
 		}
 
-		// Success! The next reconcile loop will see IsDraining=true
-		// and call checkDrainStatus, which will create the drain job.
-		logger.Info("Successfully triggered scale-down.", "pod", podToDrain)
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		if allUnderThreshold {
+			// Calculate highest index master pod (the one that will be deleted)
+			highestMasterIndex := (cluster.Spec.Masters - 1) * (1 + cluster.Spec.ReplicasPerMaster)
+			highestIndexPod := fmt.Sprintf("%s-%d", cluster.Name, highestMasterIndex)
+
+			// Find the two lowest utilization pods
+			sortedLoads := make([]PodLoad, len(podLoads))
+			copy(sortedLoads, podLoads)
+			sort.Slice(sortedLoads, func(i, j int) bool {
+				return sortedLoads[i].CPUUsage < sortedLoads[j].CPUUsage
+			})
+
+			// Get first two lowest util pods
+			lowestUtil1 := sortedLoads[0].PodName
+			lowestUtil2 := ""
+			if len(sortedLoads) > 1 {
+				lowestUtil2 = sortedLoads[1].PodName
+			}
+
+			logger.Info("Scale-down candidates identified",
+				"highestIndexPod", highestIndexPod,
+				"lowestUtil1", lowestUtil1,
+				"lowestUtil2", lowestUtil2,
+			)
+
+			// Determine drain strategy:
+			// - If highest index pod is NOT in the two lowest util pods:
+			//   -> drain highest index pod and split its load to lowestUtil1 and lowestUtil2
+			// - If highest index pod IS one of the two lowest util pods:
+			//   -> drain highest index pod and give all load to the OTHER lowest util pod
+
+			var destPod1, destPod2 string
+			if highestIndexPod != lowestUtil1 && highestIndexPod != lowestUtil2 {
+				// Highest index is NOT one of the low util pods
+				// Split between the two low util pods
+				destPod1 = lowestUtil1
+				destPod2 = lowestUtil2
+				logger.Info("Strategy: Split load from highest index to two low-util pods",
+					"from", highestIndexPod,
+					"to1", destPod1,
+					"to2", destPod2,
+				)
+			} else {
+				// Highest index IS one of the low util pods
+				// Give all load to the other low util pod
+				if highestIndexPod == lowestUtil1 {
+					destPod1 = lowestUtil2
+					destPod2 = "" // No second destination
+				} else {
+					destPod1 = lowestUtil1
+					destPod2 = ""
+				}
+				logger.Info("Strategy: Highest index is low-util. Moving all load to single pod",
+					"from", highestIndexPod,
+					"to", destPod1,
+				)
+			}
+
+			// Set drain state with all necessary info
+			cluster.Status.IsDraining = true
+			cluster.Status.PodToDrain = highestIndexPod
+			cluster.Status.DrainDestPod1 = destPod1
+			cluster.Status.DrainDestPod2 = destPod2
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				logger.Error(err, "Failed to update status to IsDraining")
+				return ctrl.Result{}, err
+			}
+
+			logger.Info("Successfully triggered scale-down")
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
 	}
 
-	// All good, check again later.
-	logger.Info("All pods are within CPU thresholds.")
+	logger.Info("All pods within acceptable CPU range")
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }

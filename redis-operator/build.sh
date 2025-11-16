@@ -1,104 +1,88 @@
 #!/bin/bash
 
-# ---
-# This script automates the build, push, and redeployment of the redis-operator.
-# It also cleans up the old cluster and tails the logs of the new operator pod.
-#
-# Usage:
-# ./build.sh <version>
-#
-# Example:
-# ./build.sh v0.0.10
-# ---
+# === Redis Operator Build & Deploy Script ===
+# Cleans old resources, rebuilds image, pushes, redeploys, and tails logs
 
-# Exit immediately if any command fails
 set -e
 
-# 1. Check for version argument
-VERSION=$1
-if [ -z "$VERSION" ]; then
-  echo "Error: No version argument provided."
-  echo "Usage: ./build_and_deploy.sh <version>"
-  echo "Example: ./build_and_deploy.sh v0.0.10"
-  exit 1
-fi
-
+# --- Config ---
+VERSION=${1:-"v0.0.18-$(date +%s)"}  # Add timestamp if none given
 IMAGE_URL="docker.io/satyams17/redis-operator:$VERSION"
 OPERATOR_NAMESPACE="redis-operator-system"
 REDIS_NAMESPACE="default"
 LOG_FILE="redis-operator.log"
 
-# 2. Build and Deploy Operator
-echo "--- [1/4] Building and Deploying Operator Version: $VERSION ---"
-echo "Image: $IMAGE_URL"
+echo "=============================================================="
+echo " Building and Deploying Redis Operator: $VERSION"
+echo " Image: $IMAGE_URL"
+echo "=============================================================="
+
+# --- Step 1: Cleanup old operator ---
+echo "--- [1/5] Cleaning old operator deployment ---"
+
+if kubectl get deploy -n $OPERATOR_NAMESPACE | grep -q redis-operator-controller-manager; then
+  echo "Deleting old operator deployment..."
+  kubectl delete deploy -n $OPERATOR_NAMESPACE redis-operator-controller-manager --ignore-not-found
+  echo "Waiting for old operator pod termination..."
+  kubectl wait --for=delete pod -l control-plane=controller-manager -n $OPERATOR_NAMESPACE --timeout=30s || true
+else
+  echo "No old operator deployment found, continuing..."
+fi
+
+# Optional: Clean up RedisCluster CR and PVCs
+echo "Cleaning old RedisCluster resources..."
+kubectl delete rediscluster redis-cluster -n $REDIS_NAMESPACE --ignore-not-found=true
+
+# DELETE ServiceMonitor to force Prometheus refresh
+echo "Deleting old ServiceMonitor..."
+kubectl delete servicemonitor redis-cluster -n $REDIS_NAMESPACE --ignore-not-found=true
+
+# Wait for pods to terminate before deleting PVCs
+kubectl wait --for=delete pod -l app=redis-cluster -n $REDIS_NAMESPACE --timeout=60s || true
+
+kubectl delete pvc -l app=redis-cluster -n $REDIS_NAMESPACE --ignore-not-found=true --timeout=10s || true
+
+# --- Step 2: Build + Push Operator Image ---
+echo "--- [2/5] Building and pushing operator image ---"
 
 echo "Running 'make install'..."
 make install
 
-echo "Running 'make docker-build'..."
+echo "Building fresh image (no cache)..."
 make docker-build IMG=$IMAGE_URL
 
-echo "Running 'make docker-push'..."
+echo "Pushing image..."
 make docker-push IMG=$IMAGE_URL
 
-echo "Running 'make deploy'..."
+# --- Step 3: Deploy Operator ---
+echo "--- [3/5] Deploying new operator image ---"
 make deploy IMG=$IMAGE_URL
 
-echo "Operator deployment updated. Waiting 15s for new pod to be scheduled..."
+echo "Waiting for new operator pod to start..."
 sleep 10
 
-# 3. Recreate Redis Cluster
-echo "--- [2/4] Recreating Redis Cluster ---"
-
-echo "Deleting old RedisCluster CR (if it exists)..."
-kubectl delete rediscluster redis-cluster -n $REDIS_NAMESPACE --ignore-not-found=true
-
-echo "Waiting 10s for cluster pods to begin termination..."
-sleep 5
-
-echo "Deleting old PVCs with a 10s timeout (if they exist)..."
-# Use --timeout and '|| true' to continue even if it fails or times out
-kubectl delete pvc -l app=redis-cluster -n $REDIS_NAMESPACE --ignore-not-found=true --timeout=10s
-
-
-echo "Waiting 5s for resources to fully terminate..."
-sleep 5
-
-echo "Applying new cluster.yaml..."
+# --- Step 4: Deploy Redis Cluster ---
+echo "--- [4/5] Deploying Redis Cluster ---"
 kubectl apply -f cluster.yaml
+sleep 30
 
-echo "Waiting 60s for Redis pods to be created..."
-sleep 60
+# --- Step 5: Tail Operator Logs ---
+echo "--- [5/5] Tailing operator logs ---"
 
-# # 4. Check Redis Cluster Slots
-# echo "Applying VPA yaml..."
-# kubectl apply -f vpa.yaml
-
-# 5. Tail Operator Logs
-echo "--- [4/4] Tailing Operator Logs ---"
-echo "Waiting 10s for operator pod to stabilize..."
-sleep 5
-
-echo "Finding running operator pod in namespace '$OPERATOR_NAMESPACE'..."
-
-# Find the name of the new, running operator pod.
-# We look for the label 'control-plane=controller-manager' and 'Running' status.
 POD_NAME=$(kubectl get pods -n $OPERATOR_NAMESPACE \
   -l control-plane=controller-manager \
   --field-selector=status.phase=Running \
-  -o jsonpath='{.items[0].metadata.name}')
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 
 if [ -z "$POD_NAME" ]; then
-  echo "Error: Could not find a running operator pod in namespace '$OPERATOR_NAMESPACE'."
-  echo "Please check the deployment status manually:"
-  echo "kubectl get pods -n $OPERATOR_NAMESPACE"
+  echo "Error: Could not find running operator pod. Listing pods:"
+  kubectl get pods -n $OPERATOR_NAMESPACE
   exit 1
 fi
 
 echo "Found pod: $POD_NAME"
-echo "Tailing logs to console and saving to '$LOG_FILE'. (Press Ctrl+C to stop)"
+kubectl get deploy -n $OPERATOR_NAMESPACE redis-operator-controller-manager -o=jsonpath='{.spec.template.spec.containers[0].image}'
+echo
 echo "----------------------------------------------"
-
-# Tail logs and pipe to tee
-kubectl logs -f $POD_NAME -n $OPERATOR_NAMESPACE | tee redis-operator.log
-
+echo "Tailing logs (Ctrl+C to stop)..."
+kubectl logs -f $POD_NAME -n $OPERATOR_NAMESPACE | tee $LOG_FILE

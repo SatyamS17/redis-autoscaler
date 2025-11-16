@@ -69,9 +69,15 @@ type RedisClusterStatus struct {
 	// IsDraining locks the autoscaler while a pod is being drained for scale-down.
 	IsDraining bool `json:"isDraining,omitempty"`
 	// PodToDrain stores the name of the pod selected for draining.
-	PodToDrain string `json:"podToDrain,omitempty"`
+	PodToDrain    string `json:"podToDrain,omitempty"`
+	OverloadedPod string `json:"overloadedPod,omitempty"`
 
-	IsVerticallyScaling bool `json:"isVerticallyScaling,omitempty"`
+	// DrainDestPod1 is the first destination pod for drained slots
+	DrainDestPod1 string `json:"drainDestPod1,omitempty"`
+
+	// DrainDestPod2 is the second destination pod for drained slots
+	// (empty if highest index pod is one of the low-util pods)
+	DrainDestPod2 string `json:"drainDestPod2,omitempty"`
 }
 
 // +kubebuilder:object:root=true

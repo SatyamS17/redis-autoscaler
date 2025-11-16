@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: docker.io/satyams17/redis-operator
-  newTag: v0.0.42
+  newTag: v0.0.18-1763257169

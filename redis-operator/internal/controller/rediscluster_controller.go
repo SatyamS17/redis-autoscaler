@@ -61,7 +61,7 @@ type RedisClusterReconciler struct {
 
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Reconcile loop started", "request", req.NamespacedName)
+	// logger.Info("Reconcile loop started", "request", req.NamespacedName)
 
 	// 1. Fetch the RedisCluster instance
 	cluster := &appv1.RedisCluster{}
@@ -172,18 +172,15 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
 		logger.Info("Cluster is initialized, checking autoscaler")
 
-		// Only check cooldown if we're NOT already in a scaling operation
-		if !cluster.Status.IsResharding && !cluster.Status.IsDraining {
-			// Check if we're in cooldown period (1 minute)
-			if cluster.Status.LastScaleTime != nil {
-				cooldownPeriod := time.Minute
-				timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
-				if timeSinceLastScale < cooldownPeriod {
-					logger.Info("In cooldown period, skipping autoscaling",
-						"timeSinceLastScale", timeSinceLastScale.String(),
-						"cooldownPeriod", cooldownPeriod.String())
-					return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
-				}
+		// ALWAYS check cooldown FIRST, regardless of scaling state
+		if cluster.Status.LastScaleTime != nil {
+			cooldownPeriod := 1 * time.Minute
+			timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
+			if timeSinceLastScale < cooldownPeriod {
+				logger.Info("In cooldown period, skipping autoscaling",
+					"timeSinceLastScale", timeSinceLastScale.String(),
+					"cooldownPeriod", cooldownPeriod.String())
+				return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
 			}
 		}
 
@@ -442,7 +439,10 @@ func (r *RedisClusterReconciler) serviceMonitorForRedisCluster(cluster *appv1.Re
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name,
 			Namespace: cluster.Namespace,
-			Labels:    map[string]string{"release": "prometheus"},
+			Labels: map[string]string{
+				"release": "prometheus",    // Keep this
+				"app":     "redis-cluster", // Add this for consistency
+			},
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
@@ -452,6 +452,7 @@ func (r *RedisClusterReconciler) serviceMonitorForRedisCluster(cluster *appv1.Re
 				{
 					Port:     "metrics",
 					Interval: "15s",
+					Path:     "/metrics", // Add explicit path
 				},
 			},
 		},

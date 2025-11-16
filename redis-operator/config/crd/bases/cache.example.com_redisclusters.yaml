@@ -104,6 +104,15 @@ spec:
               currentReplicas:
                 format: int32
                 type: integer
+              drainDestPod1:
+                description: DrainDestPod1 is the first destination pod for drained
+                  slots
+                type: string
+              drainDestPod2:
+                description: |-
+                  DrainDestPod2 is the second destination pod for drained slots
+                  (empty if highest index pod is one of the low-util pods)
+                type: string
               initialized:
                 type: boolean
               isDraining:
@@ -112,10 +121,10 @@ spec:
                 type: boolean
               isResharding:
                 type: boolean
-              isVerticallyScaling:
-                type: boolean
               lastScaleTime:
                 format: date-time
+                type: string
+              overloadedPod:
                 type: string
               podToDrain:
                 description: PodToDrain stores the name of the pod selected for draining.
