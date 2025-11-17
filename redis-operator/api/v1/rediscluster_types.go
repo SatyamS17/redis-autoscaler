@@ -40,11 +40,11 @@ type RedisClusterSpec struct {
 	// +kubebuilder:default=300
 	ReshardTimeoutSeconds int32 `json:"reshardTimeoutSeconds,omitempty"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=80
-	// MemoryHighThreshold is the percent of memory usage (vs. request)
-	// that triggers a vertical scale-up.
-	MemoryHighThreshold int32 `json:"memoryHighThreshold,omitempty"`
-
+	// +kubebuilder:default=70
+	MemoryThreshold int32 `json:"memoryThreshold,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=30
+	MemoryThresholdLow int32 `json:"memoryThresholdLow,omitempty"`
 	// +kubebuilder:default="1m"
 	// CPUQueryDuration is the duration for the anti-jitter CPU average.
 	// (e.g., "10m" for stable, "1m" for testing)

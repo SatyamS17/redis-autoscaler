@@ -346,7 +346,7 @@ else
   node_ips=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | \
     awk '{print $2}' | cut -d'@' -f1 | cut -d':' -f1 | sort -u)
   for ip in $node_ips; do
-    redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage no || true
+    timeout 5 redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage no || true  
   done
   sleep 2
 
@@ -386,7 +386,7 @@ else
   # Re-enable full coverage
   echo "Re-enabling full coverage requirement..."
   for ip in $node_ips; do
-    redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage yes || true
+    timeout 5 redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage yes || true
   done
   sleep 2
 fi

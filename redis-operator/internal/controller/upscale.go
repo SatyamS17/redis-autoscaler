@@ -276,7 +276,7 @@ echo "Will move $SLOTS_TO_MOVE out of $TOTAL_SLOTS slots"
 echo "Disabling full coverage check on all nodes..."
 node_ips=$(redis-cli -h $ANY_POD_HOST -p $ANY_POD_PORT cluster nodes | awk '{ print $2 }' | cut -d'@' -f1 | cut -d':' -f1 | sort -u)
 for ip in $node_ips; do
-  redis-cli -h $ip -p 6379 config set cluster-require-full-coverage no || echo "WARN: Failed config set on $ip"
+  timeout 5 redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage no || true
 done
 sleep 3
 
@@ -292,7 +292,7 @@ redis-cli --cluster reshard $ENTRYPOINT \
 # Re-enable full coverage
 echo "Re-enabling full coverage on all nodes..."
 for ip in $node_ips; do
-  redis-cli -h $ip -p 6379 config set cluster-require-full-coverage yes || echo "WARN: Failed re-enable on $ip"
+	timeout 5 redis-cli -h $ip -p 6379 CONFIG SET cluster-require-full-coverage yes || true
 done
 sleep 3
 

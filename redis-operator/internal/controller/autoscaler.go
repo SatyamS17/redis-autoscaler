@@ -31,8 +31,9 @@ type ClusterHealthStatus struct {
 }
 
 type PodLoad struct {
-	PodName  string
-	CPUUsage float64
+	PodName     string
+	CPUUsage    float64
+	MemoryUsage float64
 }
 
 // --- UPDATED ---
@@ -81,7 +82,7 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// Query Prometheus
+	// Query Prometheus for CPU
 	promClient, err := api.NewClient(api.Config{Address: PromServiceURL})
 	if err != nil {
 		logger.Error(err, "Error creating Prometheus client")
@@ -89,65 +90,134 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	}
 	v1api := prometheusv1.NewAPI(promClient)
 
-	query := fmt.Sprintf(
+	cpuQuery := fmt.Sprintf(
 		`rate(container_cpu_usage_seconds_total{container="redis", pod=~"^%s-.*", namespace="%s", service="kps-kube-prometheus-stack-kubelet"}[1m]) * 100
 	 and on(pod) redis_instance_info{role="master"}`,
 		cluster.Name,
 		cluster.Namespace,
 	)
 
-	result, warnings, err := v1api.Query(ctx, query, time.Now())
+	cpuResult, warnings, err := v1api.Query(ctx, cpuQuery, time.Now())
 	if err != nil {
-		logger.Error(err, "Error querying Prometheus", "query", query)
+		logger.Error(err, "Error querying Prometheus for CPU", "query", cpuQuery)
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
 	}
 	if len(warnings) > 0 {
-		logger.Info("Prometheus warnings", "warnings", warnings)
+		logger.Info("Prometheus CPU warnings", "warnings", warnings)
 	}
 
-	vec, ok := result.(model.Vector)
-	if !ok || vec.Len() == 0 {
-		logger.Info("Prometheus query returned no data. Skipping check.")
+	cpuVec, ok := cpuResult.(model.Vector)
+	if !ok || cpuVec.Len() == 0 {
+		logger.Info("Prometheus CPU query returned no data. Skipping check.")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// Collect all pod loads
+	// Query Prometheus for Memory
+	memoryQuery := fmt.Sprintf(
+		`(
+		  sum(container_memory_usage_bytes{container="redis", pod=~"^%s-.*", namespace="%s"}) by (pod)
+		  /
+		  sum(kube_pod_container_resource_limits{resource="memory", pod=~"^%s-.*", namespace="%s"}) by (pod)
+		) * 100
+		and on(pod) redis_instance_info{role="master"}`,
+		cluster.Name,
+		cluster.Namespace,
+		cluster.Name,
+		cluster.Namespace,
+	)
+
+	memoryResult, warnings, err := v1api.Query(ctx, memoryQuery, time.Now())
+	if err != nil {
+		logger.Error(err, "Error querying Prometheus for Memory", "query", memoryQuery)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
+	}
+	if len(warnings) > 0 {
+		logger.Info("Prometheus Memory warnings", "warnings", warnings)
+	}
+
+	memoryVec, ok := memoryResult.(model.Vector)
+	if !ok || memoryVec.Len() == 0 {
+		logger.Info("Prometheus Memory query returned no data. Skipping check.")
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	// Build a map of pod -> memory usage
+	memoryMap := make(map[string]float64)
+	for _, sample := range memoryVec {
+		podName := string(sample.Metric["pod"])
+		memoryUsage := float64(sample.Value)
+		memoryMap[podName] = memoryUsage
+	}
+
+	// Collect all pod loads (CPU + Memory)
 	var podLoads []PodLoad
-	for _, sample := range vec {
+	for _, sample := range cpuVec {
 		podName := string(sample.Metric["pod"])
 		cpuUsage := float64(sample.Value)
+
+		// Get corresponding memory usage
+		memoryUsage, ok := memoryMap[podName]
+		if !ok {
+			logger.Info("No memory data for pod, skipping", "pod", podName)
+			continue
+		}
+
 		podLoads = append(podLoads, PodLoad{
-			PodName:  podName,
-			CPUUsage: cpuUsage,
+			PodName:     podName,
+			CPUUsage:    cpuUsage,
+			MemoryUsage: memoryUsage,
 		})
+		logger.Info("Pod metrics",
+			"pod", podName,
+			"cpu", fmt.Sprintf("%.2f%%", cpuUsage),
+			"memory", fmt.Sprintf("%.2f%%", memoryUsage),
+		)
 	}
 
 	if len(podLoads) == 0 {
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// Find max loaded pod
-	maxLoad := podLoads[0]
+	// Find pod with highest CPU OR Memory (pick highest memory as tiebreaker)
+	var triggerPod PodLoad
+	triggered := false
+
+	highThreshold := float64(cluster.Spec.CpuThreshold)
+	memoryThreshold := float64(cluster.Spec.MemoryThreshold)
+
 	for _, pod := range podLoads {
-		if pod.CPUUsage > maxLoad.CPUUsage {
-			maxLoad = pod
+		if pod.CPUUsage > highThreshold || pod.MemoryUsage > memoryThreshold {
+			triggered = true
+			// First trigger or this pod has higher memory
+			if triggerPod.PodName == "" || pod.MemoryUsage > triggerPod.MemoryUsage {
+				triggerPod = pod
+			}
 		}
 	}
 
-	highThreshold := float64(cluster.Spec.CpuThreshold)
-	lowThreshold := float64(cluster.Spec.CpuThresholdLow)
-	minMasters := int32(3)
-
 	// ========== SCALE-UP DECISION ==========
-	if maxLoad.CPUUsage > highThreshold {
-		logger.Info("Triggering scale-up due to overloaded pod",
-			"pod", maxLoad.PodName,
-			"cpu", maxLoad.CPUUsage,
-			"threshold", highThreshold,
+	if triggered {
+		reason := ""
+		if triggerPod.CPUUsage > highThreshold && triggerPod.MemoryUsage > memoryThreshold {
+			reason = fmt.Sprintf("CPU and Memory overloaded (CPU: %.2f%%, Memory: %.2f%%)",
+				triggerPod.CPUUsage, triggerPod.MemoryUsage)
+		} else if triggerPod.CPUUsage > highThreshold {
+			reason = fmt.Sprintf("CPU overloaded (CPU: %.2f%%, Memory: %.2f%%)",
+				triggerPod.CPUUsage, triggerPod.MemoryUsage)
+		} else {
+			reason = fmt.Sprintf("Memory overloaded (CPU: %.2f%%, Memory: %.2f%%)",
+				triggerPod.CPUUsage, triggerPod.MemoryUsage)
+		}
+
+		logger.Info("Triggering scale-up",
+			"pod", triggerPod.PodName,
+			"reason", reason,
+			"cpuThreshold", highThreshold,
+			"memoryThreshold", memoryThreshold,
 		)
 
 		cluster.Status.IsResharding = true
-		cluster.Status.OverloadedPod = maxLoad.PodName
+		cluster.Status.OverloadedPod = triggerPod.PodName
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			logger.Error(err, "Failed to update status to IsResharding")
 			return ctrl.Result{}, err
@@ -167,12 +237,16 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 	}
 
 	// ========== SCALE-DOWN DECISION ==========
-	if lowThreshold > 0 && cluster.Spec.Masters > minMasters {
+	lowThreshold := float64(cluster.Spec.CpuThresholdLow)
+	memoryLowThreshold := float64(cluster.Spec.MemoryThresholdLow)
+	minMasters := int32(3)
 
-		// Count underutilized pods
+	if lowThreshold > 0 && memoryLowThreshold > 0 && cluster.Spec.Masters > minMasters {
+
+		// Count underutilized pods (BOTH CPU AND Memory must be low)
 		underutilizedCount := 0
 		for _, pod := range podLoads {
-			if pod.CPUUsage < lowThreshold {
+			if pod.CPUUsage < lowThreshold && pod.MemoryUsage < memoryLowThreshold {
 				underutilizedCount++
 			}
 		}
@@ -181,21 +255,22 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		if underutilizedCount >= 2 {
 			logger.Info("Scale-down triggered: multiple underutilized pods detected",
 				"underutilizedCount", underutilizedCount,
-				"lowThreshold", lowThreshold,
+				"cpuLowThreshold", lowThreshold,
+				"memoryLowThreshold", memoryLowThreshold,
 			)
 
 			// Calculate highest index master pod (the one that will be deleted)
 			highestMasterIndex := (cluster.Spec.Masters - 1) * (1 + cluster.Spec.ReplicasPerMaster)
 			highestIndexPod := fmt.Sprintf("%s-%d", cluster.Name, highestMasterIndex)
 
-			// Sort pods by CPU usage to find lowest utilization masters
+			// Sort pods by Memory usage (prioritize lowest memory for destinations)
 			sortedLoads := make([]PodLoad, len(podLoads))
 			copy(sortedLoads, podLoads)
 			sort.Slice(sortedLoads, func(i, j int) bool {
-				return sortedLoads[i].CPUUsage < sortedLoads[j].CPUUsage
+				return sortedLoads[i].MemoryUsage < sortedLoads[j].MemoryUsage
 			})
 
-			// Get first two lowest util pods as destinations
+			// Get first two lowest memory pods as destinations
 			lowestUtil1 := sortedLoads[0].PodName
 			lowestUtil2 := ""
 			if len(sortedLoads) > 1 {
@@ -206,10 +281,17 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 				"highestIndexPod", highestIndexPod,
 				"lowestUtil1", lowestUtil1,
 				"lowestUtil1CPU", sortedLoads[0].CPUUsage,
+				"lowestUtil1Memory", sortedLoads[0].MemoryUsage,
 				"lowestUtil2", lowestUtil2,
 				"lowestUtil2CPU", func() float64 {
 					if len(sortedLoads) > 1 {
 						return sortedLoads[1].CPUUsage
+					}
+					return 0
+				}(),
+				"lowestUtil2Memory", func() float64 {
+					if len(sortedLoads) > 1 {
+						return sortedLoads[1].MemoryUsage
 					}
 					return 0
 				}(),
@@ -263,7 +345,7 @@ func (r *RedisClusterReconciler) monitorCPUUsage(ctx context.Context, cluster *a
 		)
 	}
 
-	logger.Info("All pods within acceptable CPU range")
+	logger.Info("All pods within acceptable CPU and memory ranges")
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 

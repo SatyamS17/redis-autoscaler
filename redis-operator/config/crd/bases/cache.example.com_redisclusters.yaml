@@ -61,11 +61,13 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
-              memoryHighThreshold:
-                default: 80
-                description: |-
-                  MemoryHighThreshold is the percent of memory usage (vs. request)
-                  that triggers a vertical scale-up.
+              memoryThreshold:
+                default: 70
+                format: int32
+                minimum: 1
+                type: integer
+              memoryThresholdLow:
+                default: 30
                 format: int32
                 minimum: 1
                 type: integer
