@@ -256,7 +256,7 @@ func (r *RedisClusterReconciler) reconcileResource(ctx context.Context, obj clie
 		return err
 	}
 
-	log.FromContext(ctx).Info("Updating existing resource", "Kind", obj.GetObjectKind().GroupVersionKind().Kind, "Name", key.Name)
+	// log.FromContext(ctx).Info("Updating existing resource", "Kind", obj.GetObjectKind().GroupVersionKind().Kind, "Name", key.Name)
 	obj.SetResourceVersion(current.GetResourceVersion())
 	return r.Update(ctx, obj)
 }

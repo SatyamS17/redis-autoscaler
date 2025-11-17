@@ -101,7 +101,7 @@ func (r *RedisClusterReconciler) checkDrainStatus(ctx context.Context, cluster *
 		}
 
 		// Clean up the successful job
-		// _ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		_ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
 
 		logger.Info("Scale-down complete. Main reconciler will now remove the pod.")
 		return ctrl.Result{}, nil
@@ -110,7 +110,7 @@ func (r *RedisClusterReconciler) checkDrainStatus(ctx context.Context, cluster *
 	if drainJob.Status.Failed > 0 {
 		logger.Error(fmt.Errorf("drain job %s failed", jobName), "Draining failed")
 		// Clean up the failed job to allow a retry
-		// _ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		_ = r.Delete(ctx, drainJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
 		cluster.Status.IsDraining = false
 		cluster.Status.PodToDrain = ""
 		cluster.Status.DrainDestPod1 = ""
@@ -149,7 +149,6 @@ func (r *RedisClusterReconciler) drainJobForRedisCluster(
 	cliCmd := `
 #!/bin/sh
 set -ex
-trap 'exit_code=$?; echo "--- SCRIPT EXITED (Status: $exit_code) ---"; echo "Pod will stay alive for 10 minutes."; sleep 600; exit $exit_code' EXIT
 
 echo "=== Smart Scale-Down with Two-Way Split ==="
 POD_TO_DRAIN="$POD_TO_DRAIN"
@@ -159,6 +158,24 @@ SERVICE_NAME="$SERVICE_NAME"
 NAMESPACE="$NAMESPACE"
 ENTRYPOINT_HOST="$ENTRYPOINT_HOST"
 ENTRYPOINT="$ENTRYPOINT_WITH_PORT"
+
+# ========== CLUSTER FIX (ADDED) ==========
+echo "=== Step 0: Running cluster fix to ensure consistency ==="
+redis-cli --cluster fix $ENTRYPOINT --cluster-fix-with-unreachable-masters || {
+  echo "WARNING: Cluster fix encountered issues, but continuing..."
+}
+
+# Verify cluster state after fix
+CLUSTER_STATE=$(redis-cli -h $ENTRYPOINT_HOST cluster info | grep cluster_state | cut -d: -f2 | tr -d '\r')
+if [ "$CLUSTER_STATE" != "ok" ]; then
+  echo "ERROR: Cluster state is '$CLUSTER_STATE' after fix (expected: ok)"
+  redis-cli -h $ENTRYPOINT_HOST cluster info
+  redis-cli -h $ENTRYPOINT_HOST cluster nodes
+  exit 1
+fi
+
+echo "Cluster fix complete. State: $CLUSTER_STATE"
+# ========================================
 
 # 1. Resolve IPs
 echo "Resolving pod IPs..."
@@ -223,7 +240,7 @@ fi
 
 # 3. Check if node has slots
 SLOT_COUNT=$(redis-cli -h $ENTRYPOINT_HOST cluster nodes | \
-  grep "$NODE_TO_DRAIN" | awk '{
+  grep "^$NODE_TO_DRAIN" | awk '{
     slots=0
     for(i=9; i<=NF; i++) {
       if($i ~ /^[0-9]+-[0-9]+$/) {
@@ -340,29 +357,26 @@ else
     REMAINING_SLOTS=$((SLOT_COUNT - HALF_SLOTS))
     
     echo "Migrating $HALF_SLOTS slots to $DEST1_ID..."
-    redis-cli --cluster reshard $ENTRYPOINT \
+    echo "$HALF_SLOTS" | redis-cli --cluster reshard $ENTRYPOINT \
       --cluster-from $NODE_TO_DRAIN \
       --cluster-to $DEST1_ID \
-      --cluster-slots $HALF_SLOTS \
       --cluster-yes \
       --cluster-timeout 10000 || true
 
     sleep 5
 
     echo "Migrating remaining $REMAINING_SLOTS slots to $DEST2_ID..."
-    redis-cli --cluster reshard $ENTRYPOINT \
+    echo "$REMAINING_SLOTS" | redis-cli --cluster reshard $ENTRYPOINT \
       --cluster-from $NODE_TO_DRAIN \
       --cluster-to $DEST2_ID \
-      --cluster-slots $REMAINING_SLOTS \
       --cluster-yes \
       --cluster-timeout 10000 || true
   else
     # All slots go to single destination
     echo "Migrating all $SLOT_COUNT slots to $DEST1_ID..."
-    redis-cli --cluster reshard $ENTRYPOINT \
+    echo "$SLOT_COUNT" | redis-cli --cluster reshard $ENTRYPOINT \
       --cluster-from $NODE_TO_DRAIN \
       --cluster-to $DEST1_ID \
-      --cluster-slots $SLOT_COUNT \
       --cluster-yes \
       --cluster-timeout 10000 || true
   fi
