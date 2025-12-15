@@ -1,0 +1,49 @@
+apiVersion: cache.example.com/v1
+kind: RedisCluster
+metadata:
+  name: redis-cluster-existing
+  namespace: default
+spec:
+  # Existing cluster mode - operator will discover topology instead of bootstrapping
+  existingCluster: true
+
+  # Pod selector to find your existing Redis pods
+  # Adjust these labels to match your existing Redis deployment
+  podSelector:
+    app: redis
+    cluster: my-existing-cluster
+
+  # Name of the existing headless service
+  serviceName: my-existing-cluster-headless
+
+  # Set to false to only manage autoscaling without managing the StatefulSet
+  # Set to true if you want the operator to also manage the StatefulSet
+  manageStatefulSet: false
+
+  # Name of the existing StatefulSet (only needed if manageStatefulSet is true)
+  # statefulSetName: my-existing-statefulset
+
+  # Current number of active masters in your existing cluster
+  masters: 3
+
+  # Minimum masters (for scale-down limits)
+  minMasters: 3
+
+  # Number of replicas per master in your existing cluster
+  replicasPerMaster: 1
+
+  # Redis version (should match your existing deployment)
+  redisVersion: "7.2"
+
+  # Autoscaling configuration
+  autoScaleEnabled: true
+  cpuThreshold: 70
+  cpuThresholdLow: 20
+  memoryThreshold: 70
+  memoryThresholdLow: 30
+  reshardTimeoutSeconds: 600
+  scaleCooldownSeconds: 60
+
+  # Prometheus configuration
+  prometheusURL: "http://prometheus-operated.monitoring.svc:9090"
+  metricsQueryInterval: 15

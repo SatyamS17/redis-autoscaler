@@ -37,56 +37,126 @@ spec:
           metadata:
             type: object
           spec:
-            description: RedisClusterSpec defines the desired state of RedisCluster.
+            description: RedisClusterSpec defines the desired state of a Redis Cluster
+              with autoscaling capabilities.
             properties:
               autoScaleEnabled:
+                description: AutoScaleEnabled enables or disables the autoscaling
+                  feature.
                 type: boolean
-              cpuQueryDuration:
-                default: 1m
-                description: |-
-                  CPUQueryDuration is the duration for the anti-jitter CPU average.
-                  (e.g., "10m" for stable, "1m" for testing)
-                type: string
-              cpuQueryWindow:
-                default: 1m
-                description: CPUQueryWindow is the rate window for the CPU query.
-                type: string
               cpuThreshold:
+                description: CpuThreshold is the CPU usage percentage that triggers
+                  scale-up (0-100).
                 format: int32
+                maximum: 100
+                minimum: 1
                 type: integer
               cpuThresholdLow:
+                default: 20
+                description: CpuThresholdLow is the CPU usage percentage below which
+                  scale-down is considered (0-100).
                 format: int32
+                maximum: 100
+                minimum: 1
                 type: integer
+              existingCluster:
+                description: |-
+                  ExistingCluster indicates this CR is managing an existing Redis cluster.
+                  When true, the operator will discover the cluster topology instead of bootstrapping.
+                type: boolean
+              manageStatefulSet:
+                default: true
+                description: |-
+                  ManageStatefulSet indicates whether the operator should manage the StatefulSet.
+                  When false, the operator only manages autoscaling for an externally-managed StatefulSet.
+                type: boolean
               masters:
+                description: Masters is the number of active master nodes in the cluster
+                  (not including standby).
                 format: int32
                 minimum: 1
                 type: integer
               memoryThreshold:
                 default: 70
+                description: MemoryThreshold is the memory usage percentage that triggers
+                  scale-up (0-100).
                 format: int32
+                maximum: 100
                 minimum: 1
                 type: integer
               memoryThresholdLow:
                 default: 30
+                description: MemoryThresholdLow is the memory usage percentage below
+                  which scale-down is considered (0-100).
                 format: int32
+                maximum: 100
                 minimum: 1
+                type: integer
+              metricsQueryInterval:
+                default: 15
+                description: MetricsQueryInterval is how often to query Prometheus
+                  for metrics in seconds.
+                format: int32
+                maximum: 300
+                minimum: 5
                 type: integer
               minMasters:
                 default: 3
+                description: MinMasters is the minimum number of masters the cluster
+                  can scale down to.
                 format: int32
+                minimum: 3
                 type: integer
+              podSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  PodSelector is a label selector to identify Redis pods in an existing cluster.
+                  Required when ExistingCluster is true. Example: {"app": "redis", "cluster": "my-cluster"}
+                type: object
+              prometheusURL:
+                default: http://prometheus-operated.monitoring.svc:9090
+                description: PrometheusURL is the URL to the Prometheus server for
+                  metrics queries.
+                type: string
               redisVersion:
+                default: "7.2"
+                description: RedisVersion specifies the Redis Docker image version
+                  to use.
                 type: string
               replicasPerMaster:
+                default: 1
+                description: ReplicasPerMaster is the number of replica nodes per
+                  master for high availability.
                 format: int32
                 minimum: 0
                 type: integer
               reshardTimeoutSeconds:
-                default: 300
+                default: 600
+                description: ReshardTimeoutSeconds is the timeout for reshard and
+                  drain jobs in seconds.
                 format: int32
                 maximum: 3600
                 minimum: 60
                 type: integer
+              scaleCooldownSeconds:
+                default: 60
+                description: ScaleCooldownSeconds is the minimum time between scaling
+                  operations in seconds.
+                format: int32
+                maximum: 3600
+                minimum: 30
+                type: integer
+              serviceName:
+                description: |-
+                  ServiceName is the name of the headless service for the existing cluster.
+                  If not specified, defaults to "<cluster-name>-headless"
+                type: string
+              statefulSetName:
+                description: |-
+                  StatefulSetName is the name of the existing StatefulSet to manage.
+                  If not specified, defaults to the cluster name.
+                type: string
             required:
             - autoScaleEnabled
             - cpuThreshold
@@ -95,44 +165,60 @@ spec:
             - replicasPerMaster
             type: object
           status:
-            description: RedisClusterStatus defines the observed state of RedisCluster.
+            description: RedisClusterStatus defines the observed state of a Redis
+              Cluster.
             properties:
-              avgCpuUsage:
-                format: int32
-                type: integer
               currentMasters:
+                description: CurrentMasters is the actual number of active master
+                  nodes currently running.
                 format: int32
                 type: integer
               currentReplicas:
+                description: CurrentReplicas is the actual number of replica nodes
+                  currently running.
                 format: int32
                 type: integer
               drainDestPod1:
-                description: DrainDestPod1 is the first destination pod for drained
-                  slots
+                description: DrainDestPod1 is the first destination pod for slots
+                  from the drained pod.
                 type: string
               drainDestPod2:
                 description: |-
-                  DrainDestPod2 is the second destination pod for drained slots
-                  (empty if highest index pod is one of the low-util pods)
+                  DrainDestPod2 is the second destination pod for slots from the drained pod.
+                  Empty if only one destination is needed.
                 type: string
               initialized:
+                description: Initialized indicates whether the cluster has completed
+                  bootstrap.
                 type: boolean
               isDraining:
-                description: IsDraining locks the autoscaler while a pod is being
-                  drained for scale-down.
+                description: IsDraining indicates a scale-down operation is in progress.
+                type: boolean
+              isProvisioningStandby:
+                description: IsProvisioningStandby indicates new standby pods are
+                  being added to the cluster.
                 type: boolean
               isResharding:
+                description: IsResharding indicates a scale-up operation is in progress.
                 type: boolean
               lastScaleTime:
+                description: LastScaleTime records when the last scaling operation
+                  started (for cooldown).
                 format: date-time
                 type: string
               overloadedPod:
+                description: OverloadedPod is the pod that triggered the current scale-up
+                  operation.
                 type: string
               podToDrain:
-                description: PodToDrain stores the name of the pod selected for draining.
+                description: PodToDrain is the pod being drained during the current
+                  scale-down operation.
+                type: string
+              standbyPod:
+                description: StandbyPod is the name of the pod serving as the hot
+                  standby (0 hash slots).
                 type: string
             required:
-            - avgCpuUsage
             - currentMasters
             - currentReplicas
             type: object

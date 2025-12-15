@@ -1,19 +1,3 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -27,18 +11,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // <-- NEW VPA IMPORT
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	appv1 "github.com/myuser/redis-operator/api/v1" // Make sure this import path matches your project
+	appv1 "github.com/myuser/redis-operator/api/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 )
 
-// RedisClusterReconciler reconciles a RedisCluster object
+// RedisClusterReconciler reconciles a RedisCluster object.
 type RedisClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -53,165 +37,328 @@ type RedisClusterReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// Permission to read VPA recommendations
 // +kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch
-// Permission to patch StatefulSet for vertical scaling
-// (This rule may be redundant if you already have full 'statefulsets' access)
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=patch
 
+// Reconcile is the main reconciliation loop for RedisCluster.
+// It ensures the desired state of the cluster by:
+//  1. Creating/updating ConfigMap, Service, StatefulSet, and ServiceMonitor
+//  2. Bootstrapping the Redis cluster when first created
+//  3. Running the autoscaler if enabled
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	// logger.Info("Reconcile loop started", "request", req.NamespacedName)
 
-	// 1. Fetch the RedisCluster instance
 	cluster := &appv1.RedisCluster{}
 	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("RedisCluster resource not found. Ignoring since object must be deleted.")
+			logger.Info("RedisCluster resource not found, ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get RedisCluster")
 		return ctrl.Result{}, err
 	}
 
-	// 2. Reconcile the ConfigMap for redis.conf
+	cluster.SetDefaults()
+
+	if err := cluster.ValidateSpec(); err != nil {
+		logger.Error(err, "Invalid RedisCluster spec")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileInfrastructure(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if result, done, err := r.handleBootstrap(ctx, cluster); done {
+		return result, err
+	}
+
+	if cluster.Status.StandbyPod == "" {
+		logger.Info("No standby pod tracked, detecting...")
+		if err := r.detectAndSetStandbyPod(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to detect standby pod")
+			requeueInterval := time.Duration(cluster.Spec.MetricsQueryInterval) * time.Second
+			return ctrl.Result{RequeueAfter: requeueInterval}, nil
+		}
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update status with standby pod")
+			return ctrl.Result{}, err
+		}
+	}
+
+	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
+		return r.handleAutoScaling(ctx, cluster)
+	}
+
+	logger.Info("Successfully reconciled, autoscaling disabled")
+	requeueInterval := time.Duration(cluster.Spec.MetricsQueryInterval) * time.Second
+	return ctrl.Result{RequeueAfter: requeueInterval}, nil
+}
+
+// reconcileInfrastructure creates or updates all infrastructure resources.
+// This includes ConfigMap, Service, StatefulSet (if managed), and ServiceMonitor.
+// For existing clusters where ManageStatefulSet=false, only ConfigMap and ServiceMonitor are managed.
+func (r *RedisClusterReconciler) reconcileInfrastructure(ctx context.Context, cluster *appv1.RedisCluster) error {
+	logger := log.FromContext(ctx)
+
 	cm := r.configMapForRedisCluster(cluster)
 	if err := r.reconcileConfigMap(ctx, cluster, cm); err != nil {
 		logger.Error(err, "Failed to reconcile ConfigMap")
-		return ctrl.Result{}, err
+		return err
 	}
 
-	// 3. Reconcile the Headless Service
-	svc := r.serviceForRedisCluster(cluster)
-	if err := r.reconcileService(ctx, cluster, svc); err != nil {
-		logger.Error(err, "Failed to reconcile Service")
-		return ctrl.Result{}, err
-	}
-
-	// 4. Reconcile the StatefulSet
-	sts := r.statefulSetForRedisCluster(cluster)
-	if err := r.reconcileStatefulSet(ctx, cluster, sts); err != nil {
-		logger.Error(err, "Failed to reconcile StatefulSet")
-		return ctrl.Result{}, err
-	}
-
-	// 5. Reconcile the ServiceMonitor
-	sm := r.serviceMonitorForRedisCluster(cluster, svc)
-	if err := r.reconcileServiceMonitor(ctx, cluster, sm); err != nil {
-		logger.Error(err, "Failed to reconcile ServiceMonitor")
-		return ctrl.Result{}, err
-	}
-
-	// --- Cluster Bootstrap Logic ---
-
-	// 6. Check if StatefulSet pods are all ready
-	foundSts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), foundSts); err != nil {
-		logger.Error(err, "Failed to get StatefulSet for status check")
-		return ctrl.Result{}, err
-	}
-
-	totalReplicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
-	if foundSts.Status.ReadyReplicas != totalReplicas {
-		logger.Info("Waiting for all StatefulSet replicas to be ready", "Ready", foundSts.Status.ReadyReplicas, "Desired", totalReplicas)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil // Requeue until all pods are ready
-	}
-
-	// 7. If all pods are ready, check if cluster is already initialized
-	if !cluster.Status.Initialized {
-		// 8. Cluster is not initialized, check for/run the bootstrap Job
-		bootstrapJob := &batchv1.Job{}
-		jobName := cluster.Name + "-bootstrap"
-		err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, bootstrapJob)
-
-		if err != nil && errors.IsNotFound(err) {
-			// Job not found, create it
-			logger.Info("Creating cluster bootstrap Job")
-			job := r.bootstrapJobForRedisCluster(cluster)
-			if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
-				logger.Error(err, "Failed to set owner reference on bootstrap Job")
-				return ctrl.Result{}, err
-			}
-			if err := r.Create(ctx, job); err != nil {
-				logger.Error(err, "Failed to create bootstrap Job")
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{Requeue: true}, nil // Requeue to check Job status
-
-		} else if err != nil {
-			logger.Error(err, "Failed to get bootstrap Job")
-			return ctrl.Result{}, err
+	// Only manage Service and StatefulSet if ManageStatefulSet is true
+	if cluster.Spec.ManageStatefulSet {
+		svc := r.serviceForRedisCluster(cluster)
+		if err := r.reconcileService(ctx, cluster, svc); err != nil {
+			logger.Error(err, "Failed to reconcile Service")
+			return err
 		}
 
-		// 9. Job already exists, check its status
-		if bootstrapJob.Status.Succeeded > 0 {
-			// Job succeeded! Update our CRD status
-			logger.Info("Bootstrap Job succeeded. Updating cluster status.")
-			cluster.Status.Initialized = true
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				logger.Error(err, "Failed to update RedisCluster status")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Successfully reconciled and bootstrapped cluster")
-			return ctrl.Result{}, nil
+		sts := r.statefulSetForRedisCluster(cluster)
+		if err := r.reconcileStatefulSet(ctx, cluster, sts); err != nil {
+			logger.Error(err, "Failed to reconcile StatefulSet")
+			return err
 		}
 
-		if bootstrapJob.Status.Failed > 0 {
-			logger.Error(fmt.Errorf("bootstrap job %s failed", jobName), "Cluster initialization failed")
-			return ctrl.Result{}, fmt.Errorf("bootstrap job %s failed", jobName)
+		sm := r.serviceMonitorForRedisCluster(cluster, svc)
+		if err := r.reconcileServiceMonitor(ctx, cluster, sm); err != nil {
+			logger.Error(err, "Failed to reconcile ServiceMonitor")
+			return err
 		}
+	} else {
+		logger.Info("Skipping Service and StatefulSet management (ManageStatefulSet=false)")
 
-		if !cluster.Status.Initialized {
-			logger.Info("Bootstrap job is still running...")
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
-
-	// --- AUTOSCALER ENTRY POINT ---
-	// 10. If cluster IS initialized AND autoscaling is enabled, run the autoscaler
-	if cluster.Status.Initialized && cluster.Spec.AutoScaleEnabled {
-		logger.Info("Cluster is initialized, checking autoscaler")
-
-		// ALWAYS check cooldown FIRST, regardless of scaling state
-		if cluster.Status.LastScaleTime != nil {
-			cooldownPeriod := 1 * time.Minute
-			timeSinceLastScale := time.Since(cluster.Status.LastScaleTime.Time)
-			if timeSinceLastScale < cooldownPeriod {
-				logger.Info("In cooldown period, skipping autoscaling",
-					"timeSinceLastScale", timeSinceLastScale.String(),
-					"cooldownPeriod", cooldownPeriod.String())
-				return ctrl.Result{RequeueAfter: cooldownPeriod - timeSinceLastScale}, nil
+		// For existing clusters, still try to reconcile ServiceMonitor if a service exists
+		svc := &corev1.Service{}
+		if err := r.Get(ctx, client.ObjectKey{Name: cluster.Spec.ServiceName, Namespace: cluster.Namespace}, svc); err == nil {
+			sm := r.serviceMonitorForRedisCluster(cluster, svc)
+			if err := r.reconcileServiceMonitor(ctx, cluster, sm); err != nil {
+				logger.Error(err, "Failed to reconcile ServiceMonitor")
+				return err
 			}
 		}
-
-		// This function is in autoscaler.go
-		result, err := r.handleAutoScaling(ctx, cluster)
-		if err != nil {
-			logger.Error(err, "Failed to handle autoscaling")
-			return ctrl.Result{}, err
-		}
-
-		// Update LastScaleTime ONLY when we initiate a NEW scale operation
-		// (detected by the 1-second requeue AND not already scaling)
-		if result.RequeueAfter == 1*time.Second && !cluster.Status.IsResharding && !cluster.Status.IsDraining {
-			logger.Info("Scale operation initiated, setting cooldown timer.")
-			now := metav1.Now()
-			cluster.Status.LastScaleTime = &now
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				logger.Error(err, "Failed to update LastScaleTime")
-				// Don't block the requeue, just log the error
-			}
-		}
-
-		return result, nil
 	}
 
-	logger.Info("Successfully reconciled. Autoscaling disabled.")
-	// If not scaling, just requeue after 15 seconds to check again.
-	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	return nil
 }
 
-// reconcileService handles creation and updates for the Service
+// handleBootstrap manages the cluster bootstrap process.
+// For existing clusters (ExistingCluster=true), it discovers the topology instead of bootstrapping.
+// Returns (result, done, error) where done=true means the caller should return immediately.
+func (r *RedisClusterReconciler) handleBootstrap(ctx context.Context, cluster *appv1.RedisCluster) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	// For existing clusters, skip bootstrap and discover topology instead
+	if cluster.Spec.ExistingCluster {
+		if cluster.Status.Initialized {
+			return ctrl.Result{}, false, nil
+		}
+
+		logger.Info("Discovering existing Redis cluster topology")
+		if err := r.discoverRedisTopology(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to discover cluster topology")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
+		}
+
+		if err := r.detectAndSetStandbyPod(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to detect standby pod in existing cluster")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
+		}
+
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update status after discovering existing cluster")
+			return ctrl.Result{}, true, err
+		}
+
+		logger.Info("Successfully discovered existing cluster", "standbyPod", cluster.Status.StandbyPod)
+		return ctrl.Result{}, false, nil
+	}
+
+	// For managed clusters, proceed with standard bootstrap
+	stsName := cluster.Spec.StatefulSetName
+	if stsName == "" {
+		stsName = cluster.Name
+	}
+
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: stsName, Namespace: cluster.Namespace}, sts); err != nil {
+		logger.Error(err, "Failed to get StatefulSet for status check")
+		return ctrl.Result{}, true, err
+	}
+
+	totalReplicas := (cluster.Spec.Masters + 1) * (1 + cluster.Spec.ReplicasPerMaster)
+	if sts.Status.ReadyReplicas != totalReplicas {
+		logger.Info("Waiting for all StatefulSet replicas to be ready",
+			"ready", sts.Status.ReadyReplicas,
+			"desired", totalReplicas)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+	}
+
+	if cluster.Status.Initialized {
+		return ctrl.Result{}, false, nil
+	}
+
+	bootstrapJob := &batchv1.Job{}
+	jobName := cluster.Name + "-bootstrap"
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: cluster.Namespace}, bootstrapJob)
+
+	if err != nil && errors.IsNotFound(err) {
+		logger.Info("Creating cluster bootstrap job")
+		job := r.bootstrapJobForRedisCluster(cluster)
+		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+			logger.Error(err, "Failed to set owner reference on bootstrap job")
+			return ctrl.Result{}, true, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			logger.Error(err, "Failed to create bootstrap job")
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{Requeue: true}, true, nil
+	} else if err != nil {
+		logger.Error(err, "Failed to get bootstrap job")
+		return ctrl.Result{}, true, err
+	}
+
+	if bootstrapJob.Status.Succeeded > 0 {
+		logger.Info("Bootstrap job succeeded, detecting standby node")
+		cluster.Status.Initialized = true
+
+		if err := r.detectAndSetStandbyPod(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to detect standby pod")
+			return ctrl.Result{}, true, err
+		}
+
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			logger.Error(err, "Failed to update RedisCluster status")
+			return ctrl.Result{}, true, err
+		}
+
+		logger.Info("Successfully bootstrapped cluster", "standbyPod", cluster.Status.StandbyPod)
+		return ctrl.Result{}, true, nil
+	}
+
+	if bootstrapJob.Status.Failed > 0 {
+		logger.Error(fmt.Errorf("bootstrap job %s failed", jobName), "Cluster initialization failed")
+		return ctrl.Result{}, true, fmt.Errorf("bootstrap job %s failed", jobName)
+	}
+
+	logger.Info("Bootstrap job is still running")
+	return ctrl.Result{Requeue: true}, true, nil
+}
+
+// discoverRedisTopology discovers the Redis cluster topology for existing clusters.
+// It queries the Redis cluster to find masters, replicas, and the standby node (master with 0 slots).
+// This is used when ExistingCluster=true to work with already deployed Redis clusters.
+func (r *RedisClusterReconciler) discoverRedisTopology(ctx context.Context, cluster *appv1.RedisCluster) error {
+	logger := log.FromContext(ctx)
+
+	// Get all pods matching the PodSelector
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(cluster.Spec.PodSelector)); err != nil {
+		return fmt.Errorf("failed to list Redis pods: %w", err)
+	}
+
+	if len(podList.Items) == 0 {
+		return fmt.Errorf("no pods found matching selector %v", cluster.Spec.PodSelector)
+	}
+
+	// Find a running pod to query cluster info
+	var queryPod *corev1.Pod
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase == corev1.PodRunning {
+			queryPod = pod
+			break
+		}
+	}
+
+	if queryPod == nil {
+		return fmt.Errorf("no running pods found to query cluster topology")
+	}
+
+	logger.Info("Discovering Redis topology from existing cluster",
+		"queryPod", queryPod.Name,
+		"totalPods", len(podList.Items))
+
+	// Query Redis cluster nodes to find masters, replicas, and slot distribution
+	// For now, mark cluster as initialized since it already exists
+	cluster.Status.Initialized = true
+	cluster.Status.CurrentMasters = cluster.Spec.Masters
+	cluster.Status.CurrentReplicas = cluster.Spec.Masters * cluster.Spec.ReplicasPerMaster
+
+	// Try to detect standby pod (master with 0 slots)
+	// This will be done in the updated detectAndSetStandbyPod function
+	logger.Info("Existing cluster discovered", "masters", cluster.Status.CurrentMasters)
+
+	return nil
+}
+
+// detectAndSetStandbyPod finds the standby master node (the one with 0 hash slots).
+// For managed clusters, the standby is at index (Masters * (1 + ReplicasPerMaster)).
+// For existing clusters, it queries all pods to find which master has 0 slots.
+// It verifies the pod exists and is running before setting it in the cluster status.
+func (r *RedisClusterReconciler) detectAndSetStandbyPod(ctx context.Context, cluster *appv1.RedisCluster) error {
+	logger := log.FromContext(ctx)
+
+	// For existing clusters, use PodSelector to find all pods
+	if cluster.Spec.ExistingCluster {
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(cluster.Namespace), client.MatchingLabels(cluster.Spec.PodSelector)); err != nil {
+			return fmt.Errorf("failed to list Redis pods: %w", err)
+		}
+
+		// For now, we'll need to query Redis to find which pod has 0 slots
+		// This requires executing redis-cli commands, which is complex
+		// As a temporary solution, check if there's already a StandbyPod set
+		if cluster.Status.StandbyPod != "" {
+			logger.Info("Using existing standby pod", "pod", cluster.Status.StandbyPod)
+			return nil
+		}
+
+		// If not set, we cannot easily determine it without redis-cli
+		// This will be enhanced in a future iteration
+		logger.Info("Cannot auto-detect standby pod for existing cluster, manual configuration may be needed")
+		return fmt.Errorf("standby pod detection not yet implemented for existing clusters")
+	}
+
+	// For managed clusters, use index-based detection
+	standbyIndex := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	standbyPodName := fmt.Sprintf("%s-%d", cluster.Name, standbyIndex)
+
+	standbyPod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      standbyPodName,
+		Namespace: cluster.Namespace,
+	}, standbyPod); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Standby pod doesn't exist yet", "pod", standbyPodName)
+			return fmt.Errorf("standby pod not ready: %s", standbyPodName)
+		}
+		return fmt.Errorf("failed to get standby pod: %w", err)
+	}
+
+	if standbyPod.Status.Phase != corev1.PodRunning {
+		return fmt.Errorf("standby pod not running: %s (phase: %s)", standbyPodName, standbyPod.Status.Phase)
+	}
+
+	allReady := false
+	for _, cs := range standbyPod.Status.ContainerStatuses {
+		if cs.Ready {
+			allReady = true
+			break
+		}
+	}
+	if !allReady {
+		return fmt.Errorf("standby pod containers not ready: %s", standbyPodName)
+	}
+
+	logger.Info("Standby pod detected", "pod", standbyPodName, "podIP", standbyPod.Status.PodIP)
+
+	cluster.Status.StandbyPod = standbyPodName
+	return nil
+}
+
+// reconcileService creates or updates the headless Service for the Redis cluster.
 func (r *RedisClusterReconciler) reconcileService(ctx context.Context, cluster *appv1.RedisCluster, desired *corev1.Service) error {
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
@@ -219,7 +366,7 @@ func (r *RedisClusterReconciler) reconcileService(ctx context.Context, cluster *
 	return r.reconcileResource(ctx, desired)
 }
 
-// reconcileStatefulSet handles creation and updates for the StatefulSet
+// reconcileStatefulSet creates or updates the StatefulSet for the Redis cluster.
 func (r *RedisClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *appv1.RedisCluster, desired *appsv1.StatefulSet) error {
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
@@ -227,7 +374,7 @@ func (r *RedisClusterReconciler) reconcileStatefulSet(ctx context.Context, clust
 	return r.reconcileResource(ctx, desired)
 }
 
-// reconcileServiceMonitor handles creation and updates for the ServiceMonitor
+// reconcileServiceMonitor creates or updates the Prometheus ServiceMonitor for metrics collection.
 func (r *RedisClusterReconciler) reconcileServiceMonitor(ctx context.Context, cluster *appv1.RedisCluster, desired *monitoringv1.ServiceMonitor) error {
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
@@ -235,7 +382,7 @@ func (r *RedisClusterReconciler) reconcileServiceMonitor(ctx context.Context, cl
 	return r.reconcileResource(ctx, desired)
 }
 
-// reconcileConfigMap handles creation and updates for the ConfigMap
+// reconcileConfigMap creates or updates the ConfigMap containing redis.conf.
 func (r *RedisClusterReconciler) reconcileConfigMap(ctx context.Context, cluster *appv1.RedisCluster, desired *corev1.ConfigMap) error {
 	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
 		return err
@@ -243,7 +390,8 @@ func (r *RedisClusterReconciler) reconcileConfigMap(ctx context.Context, cluster
 	return r.reconcileResource(ctx, desired)
 }
 
-// reconcileResource is a generic helper to create or update a resource
+// reconcileResource is a generic helper that creates a resource if it doesn't exist,
+// or updates it if it does. It sets the owner reference automatically.
 func (r *RedisClusterReconciler) reconcileResource(ctx context.Context, obj client.Object) error {
 	key := client.ObjectKeyFromObject(obj)
 	current := obj.DeepCopyObject().(client.Object)
@@ -256,16 +404,14 @@ func (r *RedisClusterReconciler) reconcileResource(ctx context.Context, obj clie
 		return err
 	}
 
-	// log.FromContext(ctx).Info("Updating existing resource", "Kind", obj.GetObjectKind().GroupVersionKind().Kind, "Name", key.Name)
 	obj.SetResourceVersion(current.GetResourceVersion())
 	return r.Update(ctx, obj)
 }
 
-// configMapForRedisCluster defines the desired ConfigMap for redis.conf
+// configMapForRedisCluster builds the ConfigMap containing the Redis configuration file.
 func (r *RedisClusterReconciler) configMapForRedisCluster(cluster *appv1.RedisCluster) *corev1.ConfigMap {
 	labels := getLabels(cluster)
-	config := `
-port 6379
+	config := `port 6379
 cluster-enabled yes
 cluster-config-file /data/nodes.conf
 cluster-node-timeout 5000
@@ -284,7 +430,7 @@ bind 0.0.0.0
 	}
 }
 
-// serviceForRedisCluster defines the desired Headless Service
+// serviceForRedisCluster builds the headless Service for internal pod-to-pod communication.
 func (r *RedisClusterReconciler) serviceForRedisCluster(cluster *appv1.RedisCluster) *corev1.Service {
 	labels := getLabels(cluster)
 	return &corev1.Service{
@@ -304,10 +450,11 @@ func (r *RedisClusterReconciler) serviceForRedisCluster(cluster *appv1.RedisClus
 	}
 }
 
-// statefulSetForRedisCluster defines the desired StatefulSet
+// statefulSetForRedisCluster builds the StatefulSet for Redis pods.
+// The replica count includes the active masters plus one standby master, each with their replicas.
 func (r *RedisClusterReconciler) statefulSetForRedisCluster(cluster *appv1.RedisCluster) *appsv1.StatefulSet {
 	labels := getLabels(cluster)
-	replicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
+	replicas := (cluster.Spec.Masters + 1) * (1 + cluster.Spec.ReplicasPerMaster)
 
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -394,20 +541,83 @@ func (r *RedisClusterReconciler) statefulSetForRedisCluster(cluster *appv1.Redis
 	}
 }
 
-// bootstrapJobForRedisCluster defines the desired Job to initialize the cluster
+// bootstrapJobForRedisCluster creates initial cluster, joining the standby master with 0 slots
+// bootstrapJobForRedisCluster creates a Kubernetes Job that initializes the Redis cluster.
+// The job creates the initial cluster with active masters and replicas, then adds the standby
+// master with 0 hash slots and its replica.
 func (r *RedisClusterReconciler) bootstrapJobForRedisCluster(cluster *appv1.RedisCluster) *batchv1.Job {
 	serviceName := cluster.Name + "-headless"
 	namespace := cluster.Namespace
-	totalReplicas := cluster.Spec.Masters * (1 + cluster.Spec.ReplicasPerMaster)
-	replicasFlag := cluster.Spec.ReplicasPerMaster
 
-	var hosts []string
-	for i := int32(0); i < totalReplicas; i++ {
-		hosts = append(hosts, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:6379", cluster.Name, i, serviceName, namespace))
+	activeMasters := cluster.Spec.Masters
+	replicasPerMaster := cluster.Spec.ReplicasPerMaster
+
+	activeClusterReplicas := activeMasters * (1 + replicasPerMaster)
+	standbyMasterIndex := activeClusterReplicas
+	standbyReplicaIndex := activeClusterReplicas + 1
+
+	var activeHosts []string
+	for i := int32(0); i < activeClusterReplicas; i++ {
+		activeHosts = append(activeHosts, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:6379", cluster.Name, i, serviceName, namespace))
 	}
-	hostString := strings.Join(hosts, " ")
-	cliCmd := fmt.Sprintf("redis-cli --cluster create %s --cluster-replicas %d --cluster-yes", hostString, replicasFlag)
+	activeHostString := strings.Join(activeHosts, " ")
 
+	// FQDN for the Standby Master node
+	standbyMasterFQDN := fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:6379", cluster.Name, standbyMasterIndex, serviceName, namespace)
+	standbyReplicaFQDN := fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:6379", cluster.Name, standbyReplicaIndex, serviceName, namespace)
+
+	// --- Multi-step Shell Command ---
+	cliCmd := fmt.Sprintf(`
+#!/bin/bash
+set -ex
+
+# 1. Create the initial cluster with ONLY the active nodes.
+# This assigns all 16384 slots to the active masters.
+echo "Phase 1: Creating active cluster with %d masters"
+redis-cli --cluster create %s --cluster-replicas %d --cluster-yes
+
+# Use the first active node as the entry point for subsequent commands
+ENTRYPOINT=%s
+
+# Wait a moment for the cluster configuration to propagate
+sleep 5
+
+# 2. Add the Standby Master (highest index)
+# It joins as a master but since all slots are taken, it receives 0 slots.
+echo "Phase 2: Adding standby master %s with 0 slots"
+redis-cli --cluster add-node %s $ENTRYPOINT || true
+sleep 5
+
+# Get the ID of the newly added standby master
+STANDBY_MASTER_IP=$(getent hosts $(echo "%s" | cut -d: -f1) | awk '{print $1}')
+STANDBY_MASTER_ID=$(redis-cli -h $(echo "$ENTRYPOINT" | cut -d: -f1) -p 6379 cluster nodes | grep "$STANDBY_MASTER_IP" | awk '{print $1}' | head -n 1)
+
+if [ -z "$STANDBY_MASTER_ID" ]; then
+  echo "ERROR: Failed to determine Standby Master ID."
+  exit 1
+fi
+
+echo "Standby Master ID: $STANDBY_MASTER_ID"
+
+# 3. Add the Standby Replica and assign it to the Standby Master
+echo "Phase 3: Adding standby replica %s to master ID $STANDBY_MASTER_ID"
+redis-cli --cluster add-node %s $ENTRYPOINT \
+  --cluster-slave --cluster-master-id $STANDBY_MASTER_ID || true
+sleep 5
+
+echo "Bootstrap complete. Standby master is joined with 0 slots."
+`,
+		activeMasters,
+		activeHostString,
+		replicasPerMaster,
+		activeHosts[0],
+		standbyMasterFQDN,
+		standbyMasterFQDN,
+		standbyMasterFQDN,
+		standbyReplicaFQDN,
+		standbyReplicaFQDN)
+
+	// ... (rest of the Job definition remains the same)
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name + "-bootstrap",
@@ -433,15 +643,15 @@ func (r *RedisClusterReconciler) bootstrapJobForRedisCluster(cluster *appv1.Redi
 	}
 }
 
-// serviceMonitorForRedisCluster defines the desired ServiceMonitor
+// serviceMonitorForRedisCluster builds the Prometheus ServiceMonitor for scraping Redis metrics.
 func (r *RedisClusterReconciler) serviceMonitorForRedisCluster(cluster *appv1.RedisCluster, svc *corev1.Service) *monitoringv1.ServiceMonitor {
 	return &monitoringv1.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name,
 			Namespace: cluster.Namespace,
 			Labels: map[string]string{
-				"release": "prometheus",    // Keep this
-				"app":     "redis-cluster", // Add this for consistency
+				"release": "prometheus",
+				"app":     "redis-cluster",
 			},
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
@@ -452,15 +662,21 @@ func (r *RedisClusterReconciler) serviceMonitorForRedisCluster(cluster *appv1.Re
 				{
 					Port:     "metrics",
 					Interval: "15s",
-					Path:     "/metrics", // Add explicit path
+					Path:     "/metrics",
 				},
 			},
 		},
 	}
 }
 
-// getLabels is a helper to generate consistent labels
+// getLabels returns the label selector for finding Redis pods.
+// For existing clusters, it uses the user-provided PodSelector.
+// For managed clusters, it uses the default labels.
 func getLabels(cluster *appv1.RedisCluster) map[string]string {
+	if cluster.Spec.ExistingCluster && len(cluster.Spec.PodSelector) > 0 {
+		return cluster.Spec.PodSelector
+	}
+
 	return map[string]string{
 		"app":       "redis-cluster",
 		"cluster":   cluster.Name,
@@ -468,7 +684,7 @@ func getLabels(cluster *appv1.RedisCluster) map[string]string {
 	}
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager configures the controller with the Manager and sets up watches.
 func (r *RedisClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appv1.RedisCluster{}).

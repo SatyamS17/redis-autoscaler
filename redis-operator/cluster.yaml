@@ -5,11 +5,15 @@ metadata:
   namespace: default
 spec:
   masters: 3
+  minMasters: 3
   replicasPerMaster: 1
   redisVersion: "7.2"
   autoScaleEnabled: true
   cpuThreshold: 70
   cpuThresholdLow: 20
+  memoryThreshold: 70
+  memoryThresholdLow: 30
   reshardTimeoutSeconds: 600
-
-  
+  scaleCooldownSeconds: 60
+  prometheusURL: "http://prometheus-operated.monitoring.svc:9090"
+  metricsQueryInterval: 15

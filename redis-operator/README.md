@@ -1,121 +1,237 @@
-# redis-operator
-// TODO(user): Add simple overview of use/purpose
+# Redis Cluster Autoscaler
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that provides intelligent autoscaling for Redis clusters with zero-downtime operations.
 
-## Getting Started
+## Overview
+
+The Redis Cluster Autoscaler automatically scales your Redis cluster up and down based on CPU and memory metrics. It uses a **hot standby strategy** to enable instant scale-up operations without waiting for pod startup times.
+
+### Key Features
+
+- **Zero-Downtime Scaling**: Hot standby master node enables instant scale-up (~5-10 seconds)
+- **Intelligent Monitoring**: Automatically scales based on CPU and memory usage via Prometheus
+- **Automatic Resharding**: Manages Redis cluster slot distribution during scaling operations
+- **Pre-seeded Scale-Down**: Uses Redis replication to speed up slot migration
+- **Flexible Deployment**: Supports both operator-managed and existing Redis clusters
+- **Cooldown Protection**: Prevents rapid scaling oscillations
+
+## Quick Start
 
 ### Prerequisites
-- go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- Kubernetes cluster (v1.19+)
+- Prometheus Operator (for metrics collection)
+- kubectl configured for your cluster
 
-```sh
-make docker-build docker-push IMG=<some-registry>/redis-operator:tag
-```
+### Installation
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
+```bash
+# Install CRDs
 make install
+
+# Deploy operator
+make deploy
+
+# Create a Redis cluster
+kubectl apply -f cluster.yaml
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### Basic Configuration
 
-```sh
-make deploy IMG=<some-registry>/redis-operator:tag
+```yaml
+apiVersion: cache.example.com/v1
+kind: RedisCluster
+metadata:
+  name: my-redis
+  namespace: default
+spec:
+  # Cluster size
+  masters: 3
+  minMasters: 3
+  replicasPerMaster: 1
+
+  # Autoscaling
+  autoScaleEnabled: true
+  cpuThreshold: 70        # Scale up when CPU > 70%
+  cpuThresholdLow: 20     # Scale down when CPU < 20%
+  memoryThreshold: 70     # Scale up when Memory > 70%
+  memoryThresholdLow: 30  # Scale down when Memory < 30%
+
+  # Redis version
+  redisVersion: "7.2"
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Documentation
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+Comprehensive documentation is available in the [docs](./docs) directory:
 
-```sh
-kubectl apply -k config/samples/
+### 📚 [Complete Documentation](./docs/README.md)
+
+| Document | Description |
+|----------|-------------|
+| **[User Guide](./docs/USER_GUIDE.md)** | Installation, configuration, and basic usage |
+| **[Architecture](./docs/ARCHITECTURE.md)** | How the autoscaler works internally |
+| **[Configuration Reference](./docs/CONFIGURATION.md)** | Complete configuration options reference |
+| **[Operations Guide](./docs/OPERATIONS.md)** | Monitoring, maintenance, and best practices |
+| **[Troubleshooting](./docs/TROUBLESHOOTING.md)** | Common issues and solutions |
+| **[Existing Cluster Support](./docs/EXISTING_CLUSTER_SUPPORT.md)** | Integrate with existing Redis deployments |
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Kubernetes Cluster                       │
+│                                                              │
+│  ┌──────────────┐        ┌─────────────────────────────┐   │
+│  │  Prometheus  │◄───────│  Redis Cluster Pods         │   │
+│  │              │        │  ┌────┐ ┌────┐ ┌────┐      │   │
+│  └──────┬───────┘        │  │M+R │ │M+R │ │M+R │      │   │
+│         │                │  └────┘ └────┘ └────┘      │   │
+│         │ metrics        │  ┌────┐ (Standby - 0 slots)│   │
+│         ▼                │  │ M  │                     │   │
+│  ┌──────────────┐        │  └────┘                     │   │
+│  │   Operator   │────────┴─────────────────────────────┘   │
+│  │  Controller  │                                           │
+│  │              │        Manages                            │
+│  │  - Monitor   │────────►  StatefulSet                     │
+│  │  - Scale     │────────►  Services                        │
+│  │  - Reshard   │────────►  ConfigMaps                      │
+│  └──────────────┘────────►  Jobs (bootstrap/reshard/drain)  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+
+Legend: M = Master, R = Replicas
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+**Process:**
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+1. **Monitor**: Continuously query Prometheus for CPU and memory metrics
+2. **Decide**: Trigger scale-up/down based on configured thresholds
+3. **Scale-Up**: Activate hot standby by migrating slots, provision new standby
+4. **Scale-Down**: Drain underutilized pod, it becomes the new standby
+5. **Cooldown**: Wait before allowing next scaling operation
 
-```sh
-kubectl delete -k config/samples/
+See [Architecture Overview](./docs/ARCHITECTURE.md) for detailed explanation.
+
+## Examples
+
+### Production High-Availability Cluster
+
+```yaml
+apiVersion: cache.example.com/v1
+kind: RedisCluster
+metadata:
+  name: prod-redis
+  namespace: production
+spec:
+  masters: 10
+  minMasters: 5
+  replicasPerMaster: 2
+  autoScaleEnabled: true
+  cpuThreshold: 80
+  memoryThreshold: 85
+  scaleCooldownSeconds: 300
+  redisVersion: "7.2"
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+### Existing Cluster with Autoscaling Only
 
-```sh
-make uninstall
+```yaml
+apiVersion: cache.example.com/v1
+kind: RedisCluster
+metadata:
+  name: existing-redis
+  namespace: default
+spec:
+  existingCluster: true
+  manageStatefulSet: false
+  podSelector:
+    app: redis
+    cluster: my-existing-cluster
+  serviceName: redis-headless
+  masters: 5
+  autoScaleEnabled: true
+  cpuThreshold: 70
+  memoryThreshold: 70
 ```
 
-**UnDeploy the controller from the cluster:**
+See [Configuration Reference](./docs/CONFIGURATION.md) for all options.
 
-```sh
-make undeploy
+## Development
+
+### Prerequisites
+
+- Go 1.24+
+- Docker 17.03+
+- kubectl
+- Access to Kubernetes cluster
+
+### Building from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/yourorg/redis-operator.git
+cd redis-operator
+
+# Install dependencies
+go mod download
+
+# Build the operator
+make build
+
+# Run tests
+make test
+
+# Build and push Docker image
+make docker-build docker-push IMG=<your-registry>/redis-operator:tag
+
+# Deploy to cluster
+make deploy IMG=<your-registry>/redis-operator:tag
 ```
 
-## Project Distribution
+### Project Structure
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/redis-operator:tag
 ```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/redis-operator/<tag or branch>/dist/install.yaml
+redis-operator/
+├── api/v1/                      # API definitions
+│   └── rediscluster_types.go    # RedisCluster CRD
+├── internal/controller/         # Controller logic
+│   ├── rediscluster_controller.go  # Main reconciler
+│   ├── autoscaler.go            # Autoscaling decisions
+│   ├── upscale.go               # Scale-up operations
+│   └── downscale.go             # Scale-down operations
+├── config/                      # Kubernetes manifests
+│   ├── crd/                     # CRD definitions
+│   ├── manager/                 # Operator deployment
+│   └── rbac/                    # RBAC permissions
+├── docs/                        # Documentation
+└── cluster.yaml                 # Example cluster config
 ```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-operator-sdk edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
+We welcome contributions! Please:
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## Troubleshooting
+
+If you encounter issues:
+
+1. Check the [Troubleshooting Guide](./docs/TROUBLESHOOTING.md)
+2. View operator logs: `kubectl logs -n redis-operator-system deployment/redis-operator-controller-manager`
+3. Check cluster status: `kubectl describe rediscluster <name>`
+4. Create a GitHub issue with diagnostic information
+
+## Support
+
+- **Documentation**: [docs](./docs)
+- **Issues**: [GitHub Issues](https://github.com/yourorg/redis-operator/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yourorg/redis-operator/discussions)
 
 ## License
 
@@ -133,3 +249,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+---
+
+## Acknowledgments
+
+Built with [Kubebuilder](https://book.kubebuilder.io/) and [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime).

@@ -6,7 +6,7 @@
 set -e
 
 # --- Config ---
-VERSION=${1:-"v0.0.20-$(date +%s)"}  # Add timestamp if none given
+VERSION=${1:-"v0.0.33-$(date +%s)"}  # Add timestamp if none given
 IMAGE_URL="docker.io/satyams17/redis-operator:$VERSION"
 OPERATOR_NAMESPACE="redis-operator-system"
 REDIS_NAMESPACE="default"
